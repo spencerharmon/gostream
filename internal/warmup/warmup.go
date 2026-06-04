@@ -79,6 +79,26 @@ type DiskWarmupCache struct {
 	sizeCache    sync.Map   // V264: path -> sizeEntry (cached file sizes with TTL)
 	tailCoverage sync.Map   // V265: path -> *tailRange (written range tracking)
 	writeCh      chan warmupWrite
+
+	// Vault Mode: hashes marked persistent bypass FileSize cap and are
+	// preferred-retained during quota eviction. Persisted to persist.json.
+	persistMu  persistMuType
+	persistMap map[string]persistEntry
+}
+
+// NewDiskWarmupCache constructs a cache rooted at dir. Used by tests and
+// callers that need an isolated instance. The package-level DiskWarmup
+// global is still initialised by InitDiskWarmup.
+func NewDiskWarmupCache(dir string) *DiskWarmupCache {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil
+	}
+	d := &DiskWarmupCache{
+		dir:     dir,
+		writeCh: make(chan warmupWrite, 32),
+	}
+	d.initPersist()
+	return d
 }
 
 // InitDiskWarmup creates the global warmup cache if UseDisk is enabled.
@@ -86,7 +106,12 @@ var logf = log.New(os.Stdout, "[DiskWarmup] ", log.LstdFlags)
 
 func InitDiskWarmup(quotaGB int64) {
 	diskQuotaGB = quotaGB
-	FileSize = 64 * 1024 * 1024 // default, overridden by config
+	// FileSize may have been set from config before this call (see
+	// drive-by in main.go wiring WarmupHeadSizeMB). Only fall back to the
+	// 64MB default if the caller left it at zero/negative.
+	if FileSize <= 0 {
+		FileSize = 64 * 1024 * 1024
+	}
 	for i := 0; i < 15; i++ {
 		if settings.BTsets != nil {
 			break
@@ -110,6 +135,7 @@ func InitDiskWarmup(quotaGB int64) {
 		dir:     dir,
 		writeCh: make(chan warmupWrite, 32),
 	}
+	DiskWarmup.initPersist()
 
 	if entries, err := os.ReadDir(dir); err == nil {
 		var initialTotal int64
@@ -184,7 +210,10 @@ func (d *DiskWarmupCache) writeWorker() {
 }
 
 func (d *DiskWarmupCache) WriteChunk(hash string, fileID int, data []byte, off int64) {
-	if off > FileSize || d.writeCh == nil {
+	if d.writeCh == nil {
+		return
+	}
+	if !d.IsPersistent(hash) && off > FileSize {
 		return
 	}
 
@@ -206,24 +235,29 @@ func (d *DiskWarmupCache) WriteChunk(hash string, fileID int, data []byte, off i
 }
 
 func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off int64) {
-	if off > FileSize {
-		return
-	}
-	// Only truncate chunks that straddle the boundary from below.
-	// Chunks starting AT FileSize are written in full (the boundary chunk).
-	if off < FileSize && off+int64(len(data)) > FileSize {
-		data = data[:FileSize-off]
+	persistent := d.IsPersistent(hash)
+	if !persistent {
+		if off > FileSize {
+			return
+		}
+		// Only truncate chunks that straddle the boundary from below.
+		// Chunks starting AT FileSize are written in full (the boundary chunk).
+		if off < FileSize && off+int64(len(data)) > FileSize {
+			data = data[:FileSize-off]
+		}
 	}
 
 	path := d.filePath(hash, fileID)
 
-	if val, ok := d.sizeCache.Load(path); ok {
-		if entry := val.(sizeEntry); entry.size > FileSize {
+	if !persistent {
+		if val, ok := d.sizeCache.Load(path); ok {
+			if entry := val.(sizeEntry); entry.size > FileSize {
+				return
+			}
+		} else if fi, err := os.Stat(path); err == nil && fi.Size() > FileSize {
+			d.sizeCache.Store(path, sizeEntry{size: fi.Size(), updatedAt: time.Now()})
 			return
 		}
-	} else if fi, err := os.Stat(path); err == nil && fi.Size() > FileSize {
-		d.sizeCache.Store(path, sizeEntry{size: fi.Size(), updatedAt: time.Now()})
-		return
 	}
 
 	if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -274,7 +308,7 @@ func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off
 
 	d.sizeCache.Store(path, sizeEntry{size: currentSize, updatedAt: time.Now()})
 
-	if off+int64(n) >= FileSize {
+	if !persistent && off+int64(n) >= FileSize {
 		logf.Printf("[DiskWarmup] COMPLETED %s", filepath.Base(path))
 	}
 }
@@ -533,8 +567,37 @@ func (d *DiskWarmupCache) enforceQuotaLocked(needed int64) {
 		return
 	}
 
-	sort.Slice(files, func(i, j int) bool { return files[i].modTime < files[j].modTime })
-	for _, fi := range files {
+	// Vault Mode: partition entries by persistence. Non-persistent are
+	// evicted first (LRU by mtime), then persistent entries by ascending
+	// priority, then by markedAt ASC (older marks evicted first).
+	persistSnap := d.PersistSnapshot()
+	hashOf := func(p string) string {
+		base := filepath.Base(p)
+		if i := strings.IndexByte(base, '-'); i > 0 {
+			return base[:i]
+		}
+		return ""
+	}
+	var nonPersistent, persistent []wFile
+	for _, f := range files {
+		if _, ok := persistSnap[hashOf(f.path)]; ok {
+			persistent = append(persistent, f)
+		} else {
+			nonPersistent = append(nonPersistent, f)
+		}
+	}
+	sort.Slice(nonPersistent, func(i, j int) bool { return nonPersistent[i].modTime < nonPersistent[j].modTime })
+	sort.Slice(persistent, func(i, j int) bool {
+		hi, hj := hashOf(persistent[i].path), hashOf(persistent[j].path)
+		ei, ej := persistSnap[hi], persistSnap[hj]
+		if ei.Priority != ej.Priority {
+			return ei.Priority < ej.Priority
+		}
+		return ei.MarkedAt < ej.MarkedAt
+	})
+	evictOrder := append(nonPersistent, persistent...)
+	evicted := 0
+	for _, fi := range evictOrder {
 		if diskTotal+needed <= quota {
 			break
 		}
@@ -543,6 +606,10 @@ func (d *DiskWarmupCache) enforceQuotaLocked(needed int64) {
 		d.tailCoverage.Delete(fi.path)
 		os.Remove(fi.path)
 		diskTotal -= fi.size
+		evicted++
 	}
 	atomic.StoreInt64(&d.totalSize, diskTotal)
+	if diskTotal+needed > quota {
+		logf.Printf("[Warmup] quota exhausted with %d persistent entries still resident", len(persistent))
+	}
 }
