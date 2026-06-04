@@ -3367,6 +3367,16 @@ func main() {
 	http.HandleFunc("/api/logs", dashHandler.Logs)
 	http.HandleFunc("/api/plex-thumb", dashHandler.PlexThumb)
 	http.HandleFunc("/api/kill-stream/", dashHandler.KillStream)
+
+	// External library API (Phantom Library plugin et al.)
+	libCfg := dashboard.LibraryConfig{
+		PhysicalSourcePath: physicalSourcePath,
+		FuseMountPath:      virtualMountPath,
+		TimeoutSec:         globalConfig.LibraryAddTimeoutSec,
+	}
+	libHandler := dashboard.NewLibraryHandler(libCfg, engines.NewGoStormClient(globalConfig.GoStormBaseURL))
+	http.HandleFunc("/api/library/add", libHandler.Add)
+	http.HandleFunc("/api/library/remove", libHandler.Remove)
 	safeGo(func() {
 		monCollector.Run(backgroundStopChan)
 	})

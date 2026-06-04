@@ -20,6 +20,7 @@ import (
 	"gostream/internal/catalog"
 	"gostream/internal/catalog/tmdb"
 	"gostream/internal/catalog/torrentio"
+	"gostream/internal/library"
 	"gostream/internal/metadb"
 	"gostream/internal/prowlarr"
 )
@@ -1048,7 +1049,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 		epPath := filepath.Join(seasonDir, epFilename)
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, vf.ID)
 
-		if e.createMKV(epPath, streamURL, vf.Length, magnet) {
+		if err := library.WriteStub(epPath, streamURL, vf.Length, magnet, ""); err == nil {
 			if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
 				os.Remove(existing.FilePath)
 				e.stats.Upgrades++
@@ -1127,7 +1128,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream 
 	epPath := filepath.Join(seasonDir, epFilename)
 	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
 
-	if e.createMKV(epPath, streamURL, bestFile.Length, magnet) {
+	if err := library.WriteStub(epPath, streamURL, bestFile.Length, magnet, ""); err == nil {
 		if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
 			os.Remove(existing.FilePath)
 			e.stats.Upgrades++
@@ -1294,7 +1295,7 @@ func (e *TVGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 			freshMagnet := BuildMagnet(hash, displayTitle, DefaultTrackers())
 			e.logger.Printf("Rehydrating #%d: %s...", rehydrated+1, info.Name())
 			if _, err := e.gostorm.AddTorrent(ctx, freshMagnet, displayTitle); err == nil {
-				e.createMKV(path, url, int64(size), freshMagnet)
+				_ = library.WriteStub(path, url, int64(size), freshMagnet, "")
 				rehydrated++
 				activeHashes[hash] = true
 				time.Sleep(5 * time.Second)
@@ -1401,43 +1402,11 @@ func (e *TVGoEngine) extractEpisodeFromFilename(filename string) [2]int {
 	return [2]int{0, 0}
 }
 
-func (e *TVGoEngine) sanitizeName(name string) string {
-	clean := reTVSanitize.ReplaceAllString(name, "")
-	clean = reTVSpaces.ReplaceAllString(clean, "_")
-	clean = reTVUnders.ReplaceAllString(clean, "_")
-	return strings.Trim(clean, "_")
-}
-
 func (e *TVGoEngine) getShowFolderName(showName, firstAirDate string) string {
-	cleanName := e.sanitizeName(showName)
-	year := ""
-	if len(firstAirDate) >= 4 {
-		year = firstAirDate[:4]
-	}
-	if year != "" {
-		return fmt.Sprintf("%s (%s)", cleanName, year)
-	}
-	return cleanName
+	return library.GetShowFolderName(showName, firstAirDate)
 }
 
 func (e *TVGoEngine) buildFilename(show string, season, episode int, hash8 string) string {
-	cleanShow := e.sanitizeName(show)
-	return fmt.Sprintf("%s_S%02dE%02d_%s.mkv", cleanShow, season, episode, hash8)
+	return library.BuildEpisodeFilename(show, season, episode, hash8)
 }
 
-func (e *TVGoEngine) createMKV(path, streamURL string, fileSize int64, magnet string) bool {
-	data := map[string]interface{}{
-		"url":    streamURL,
-		"size":   fileSize,
-		"magnet": magnet,
-		"imdb":   "",
-	}
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return false
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return false
-	}
-	return os.WriteFile(path, jsonData, 0644) == nil
-}

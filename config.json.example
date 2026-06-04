@@ -42,5 +42,6 @@
     "token": "",
     "library_id": 0
   },
-  "tmdb_api_key": ""
+  "tmdb_api_key": "",
+  "library_add_timeout_sec": 45
 }

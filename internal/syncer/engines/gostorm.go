@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"gostream/internal/library"
 )
 
 // GoStormClient handles HTTP operations with the GoStorm engine.
@@ -35,6 +37,23 @@ func NewGoStormClient(baseURL string) *GoStormClient {
 	}
 }
 
+// BaseURL returns the configured GoStorm base URL (no trailing slash).
+func (c *GoStormClient) BaseURL() string {
+	return c.baseURL
+}
+
+// GetTorrentFiles is a thin wrapper around GetTorrentInfo that returns
+// just the file list. Provided so that the dashboard package (which
+// must not import engines directly) can talk to the gostorm client
+// through a small interface.
+func (c *GoStormClient) GetTorrentFiles(ctx context.Context, hash string, maxWaitSec int) ([]FileStat, error) {
+	info, err := c.GetTorrentInfo(ctx, hash, maxWaitSec)
+	if err != nil {
+		return nil, err
+	}
+	return info.FileStats, nil
+}
+
 // TorrentStats holds torrent information from GoStorm.
 type TorrentStats struct {
 	Hash        string     `json:"hash"`
@@ -44,12 +63,11 @@ type TorrentStats struct {
 	FileStats   []FileStat `json:"file_stats"`
 }
 
-// FileStat holds file information from GoStorm.
-type FileStat struct {
-	ID     int    `json:"id"`
-	Path   string `json:"path"`
-	Length int64  `json:"length"`
-}
+// FileStat holds file information from GoStorm. Aliased to the
+// internal/library type so that both the engines and the HTTP
+// /api/library/add handler operate on the same value type without
+// needing per-call conversion.
+type FileStat = library.FileStat
 
 // AddTorrent adds a magnet URL to GoStorm via POST /torrents {"action":"add"}.
 // Returns the 40-char info hash or empty string on failure.
