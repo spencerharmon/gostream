@@ -775,6 +775,18 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 
 	hashStr, urlFileIdx := vfs.ExtractHashAndIndex(n.vMeta.URL)
 
+	// Vault Mode (M6.5): if the stub flagged the file persistent,
+	// register the hash so warmup writes bypass FileSize and quota
+	// eviction prefers non-persistent entries. Survives restart via
+	// persist.json + the stub itself.
+	if warmup.DiskWarmup != nil && hashStr != "" && n.vMeta.Persist {
+		prio := n.vMeta.PersistPriority
+		if prio <= 0 {
+			prio = 50
+		}
+		warmup.DiskWarmup.MarkPersistent(hashStr, prio)
+	}
+
 	// hasFullWarmup: Open returns instantly only if both head and tail warmup files are ready.
 	// headReady: Allows async Wake and direct ID injection for instant start.
 	headReady := false
@@ -2032,11 +2044,13 @@ func getOrReadMeta(path string) (*vfs.Metadata, error) {
 			}
 
 			m = &vfs.Metadata{
-				URL:    fileMeta.URL,
-				Size:   fileMeta.Size,
-				Mtime:  fileMeta.Mtime,
-				Path:   fileMeta.Path,
-				ImdbID: fileMeta.ImdbID,
+				URL:             fileMeta.URL,
+				Size:            fileMeta.Size,
+				Mtime:           fileMeta.Mtime,
+				Path:            fileMeta.Path,
+				ImdbID:          fileMeta.ImdbID,
+				Persist:         fileMeta.Persist,
+				PersistPriority: fileMeta.PersistPriority,
 			}
 
 			metaCache.Put(path, m, approximateMetadataSize(m))
@@ -2920,6 +2934,11 @@ func main() {
 	// Give engine a moment to init (hash maps etc)
 	time.Sleep(2 * time.Second)
 
+	// M6.5 drive-by: wire the existing-but-unused WarmupHeadSizeMB config to
+	// warmup.FileSize. Previously declared and ignored.
+	if globalConfig.WarmupHeadSizeMB > 0 {
+		warmup.FileSize = globalConfig.WarmupHeadSizeMB * 1024 * 1024
+	}
 	warmup.InitDiskWarmup(globalConfig.DiskWarmupQuotaGB)
 	go registry.StartRegistryWatchdog(backgroundStopChan)
 	go natpmp.NatpmpLoop(backgroundStopChan, globalConfig.NatPMP, logger)
@@ -3377,6 +3396,12 @@ func main() {
 	libHandler := dashboard.NewLibraryHandler(libCfg, engines.NewGoStormClient(globalConfig.GoStormBaseURL))
 	http.HandleFunc("/api/library/add", libHandler.Add)
 	http.HandleFunc("/api/library/remove", libHandler.Remove)
+
+	// Vault Mode (M6.5)
+	vaultHandler := dashboard.NewVaultHandler(warmup.DiskWarmup, &globalConfig)
+	http.HandleFunc("/api/library/prestage", vaultHandler.Prestage)
+	http.HandleFunc("/api/library/prestage/status", vaultHandler.Status)
+	http.HandleFunc("/api/library/unprestage", vaultHandler.Unprestage)
 	safeGo(func() {
 		monCollector.Run(backgroundStopChan)
 	})

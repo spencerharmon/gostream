@@ -16,6 +16,9 @@ type Metadata struct {
 	URL, Path, ImdbID string
 	Size              int64
 	Mtime             time.Time
+	// Vault Mode (M6.5): persist flag + priority read from stub.
+	Persist         bool
+	PersistPriority int
 }
 
 // FileMetadata represents metadata extracted from a virtual .mkv file
@@ -25,6 +28,10 @@ type FileMetadata struct {
 	Mtime  time.Time // File modification time
 	Path   string    // Original file path
 	ImdbID string    // IMDB ID from line 4 (optional)
+	// Vault Mode (M6.5): only populated from JSON stubs; legacy line
+	// format always reports Persist=false.
+	Persist         bool
+	PersistPriority int
 }
 
 // Validation constants
@@ -48,6 +55,12 @@ type MkvJSON struct {
 	Size   int64  `json:"size"`
 	Magnet string `json:"magnet"`
 	Imdb   string `json:"imdb"`
+	// Vault Mode (M6.5): when present, the FUSE open path marks the
+	// associated torrent hash as persistent in the warmup cache so the
+	// whole file is retained on SSD across the FileSize cap. Older
+	// stubs without these fields default to non-persistent.
+	Persist         bool `json:"persist,omitempty"`
+	PersistPriority int  `json:"persist_priority,omitempty"`
 }
 
 // ReadMetadataFromFile reads metadata from a virtual .mkv file.
@@ -99,11 +112,13 @@ func parseJSONFormat(content string, info os.FileInfo, path string) (*FileMetada
 	}
 
 	return &FileMetadata{
-		URL:    url,
-		Size:   j.Size,
-		Mtime:  info.ModTime(),
-		Path:   path,
-		ImdbID: imdbID,
+		URL:             url,
+		Size:            j.Size,
+		Mtime:           info.ModTime(),
+		Path:            path,
+		ImdbID:          imdbID,
+		Persist:         j.Persist,
+		PersistPriority: j.PersistPriority,
 	}, nil
 }
 
