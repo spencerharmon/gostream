@@ -198,6 +198,11 @@ type Config struct {
 	// --- State DB (V1.7.1) ---
 	EnableStateDB bool   `json:"enable_state_db"` // default: true
 	StateDBPath   string `json:"state_db_path"`   // default: <STATE>/gostream.db
+
+	// --- External library/add API ---
+	// Server-side timeout (seconds) used by POST /api/library/add when
+	// waiting for torrent metadata. Caller receives 504 on exceed.
+	LibraryAddTimeoutSec int `json:"library_add_timeout_sec"`
 }
 
 // Save persists the current configuration to config.json
@@ -259,6 +264,8 @@ func LoadConfig() Config {
 		TelemetryURL:    "https://telemetry.gostream.workers.dev",
 
 		EnableStateDB: true,
+
+		LibraryAddTimeoutSec: 45,
 
 		// Legacy Fixed Defaults
 		DefaultFileSize:         30 * 1024 * 1024 * 1024,

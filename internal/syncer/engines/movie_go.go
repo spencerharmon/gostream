@@ -20,6 +20,7 @@ import (
 	"gostream/internal/catalog"
 	"gostream/internal/catalog/tmdb"
 	"gostream/internal/catalog/torrentio"
+	"gostream/internal/library"
 	"gostream/internal/prowlarr"
 )
 
@@ -424,7 +425,7 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 			continue
 		}
 
-		videoFiles := e.filterVideoFiles(info.FileStats, c.Is4K)
+		videoFiles := library.FilterVideoFiles(info.FileStats, c.Is4K)
 		if len(videoFiles) == 0 {
 			e.setCache(e.noMKVCache, hash, CacheEntry{Reason: "no_valid_files", TS: time.Now().Unix()})
 			e.gostorm.RemoveTorrent(ctx, hash)
@@ -443,11 +444,11 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 			os.Remove(existingPath)
 		}
 
-		filename := e.buildMovieFilename(title, movie.ReleaseDate, c)
+		filename := library.BuildMovieFilename(title, movie.ReleaseDate, library.MovieStreamMeta{Title: c.Title, Hash: c.Hash, Is4K: c.Is4K})
 		mkvPath := filepath.Join(e.moviesDir, filename)
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
 
-		if e.createMKV(mkvPath, streamURL, bestFile.Length, magnet, imdbID) {
+		if err := library.WriteStub(mkvPath, streamURL, bestFile.Length, magnet, imdbID); err == nil {
 			res := "4K"
 			if !c.Is4K {
 				res = "1080p"
@@ -654,69 +655,6 @@ func (e *MovieGoEngine) extractMovieSeeders(title string) int {
 	return 0
 }
 
-func (e *MovieGoEngine) filterVideoFiles(files []FileStat, is4K bool) []FileStat {
-	var valid []FileStat
-	for _, f := range files {
-		ext := strings.ToLower(filepath.Ext(f.Path))
-		if ext != ".mkv" && ext != ".mp4" && ext != ".avi" && ext != ".mov" && ext != ".m4v" {
-			continue
-		}
-		minSize := int64(mMovie4KMinGB * 1024 * 1024 * 1024)
-		maxSize := int64(mMovie4KMaxGB * 1024 * 1024 * 1024)
-		if !is4K {
-			minSize = int64(mMovie1080PMinGB * 1024 * 1024 * 1024)
-			maxSize = int64(mMovie1080PMaxGB * 1024 * 1024 * 1024)
-		}
-		if f.Length >= minSize && f.Length <= maxSize {
-			valid = append(valid, f)
-		}
-	}
-	return valid
-}
-
-func (e *MovieGoEngine) buildMovieFilename(title, releaseDate string, stream MovieStream) string {
-	year := ""
-	if len(releaseDate) >= 4 {
-		year = releaseDate[:4]
-	} else if m := reMTitleYear.FindStringSubmatch(title); len(m) > 2 {
-		year = m[2]
-	}
-
-	base := e.sanitizeMovieFilename(title)
-	if year != "" {
-		base = fmt.Sprintf("%s_%s", base, year)
-	}
-
-	if stream.Is4K {
-		base += "_2160p"
-	} else {
-		base += "_1080p"
-	}
-
-	if reMDV.MatchString(stream.Title) {
-		base += "_DV"
-	} else if reMHDR.MatchString(stream.Title) {
-		base += "_HDR"
-	}
-
-	if reMAtmos.MatchString(stream.Title) {
-		base += "_Atmos"
-	} else if reM51.MatchString(stream.Title) {
-		base += "_5.1"
-	}
-
-	if reMRemux.MatchString(stream.Title) {
-		base += "_REMUX"
-	}
-
-	return fmt.Sprintf("%s_%s.mkv", base, stream.Hash[len(stream.Hash)-8:])
-}
-
-func (e *MovieGoEngine) sanitizeMovieFilename(s string) string {
-	s = regexp.MustCompile(`[^a-zA-Z0-9._-]`).ReplaceAllString(s, "_")
-	s = regexp.MustCompile(`_+`).ReplaceAllString(s, "_")
-	return strings.Trim(s, "_")
-}
 
 func (e *MovieGoEngine) resolveIMDB(ctx context.Context, tmdbID int, title string) string {
 	// Check cache
@@ -812,7 +750,7 @@ func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 			displayTitle := TitleFromFilename(info.Name())
 			freshMagnet := BuildMagnet(hash, displayTitle, DefaultTrackers())
 			if _, err := e.gostorm.AddTorrent(ctx, freshMagnet, displayTitle); err == nil {
-				e.createMKV(path, url, int64(size), freshMagnet, "")
+				_ = library.WriteStub(path, url, int64(size), freshMagnet, "")
 			}
 		}
 
@@ -980,19 +918,4 @@ func (e *MovieGoEngine) saveIMDBCache(file string, data map[string]IMDBCacheEntr
 	os.Rename(tmp, file)
 }
 
-func (e *MovieGoEngine) createMKV(path, streamURL string, fileSize int64, magnet, imdbID string) bool {
-	data := map[string]interface{}{
-		"url":    streamURL,
-		"size":   fileSize,
-		"magnet": magnet,
-		"imdb":   imdbID,
-	}
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return false
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return false
-	}
-	return os.WriteFile(path, jsonData, 0644) == nil
-}
+
