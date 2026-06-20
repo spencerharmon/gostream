@@ -87,6 +87,46 @@ func TestFilterEpisodeFiles(t *testing.T) {
 	}
 }
 
+func TestParseEpisodeFromFilename(t *testing.T) {
+	cases := []struct {
+		name    string
+		season  int
+		episode int
+		ok      bool
+	}{
+		{"Show.S01E02.mkv", 1, 2, true},
+		{"Show.1x02.mkv", 1, 2, true},
+		{"Show.S01E02.sample.txt", 1, 2, true},
+		{"Season 01/01 - Pilot.mkv", 1, 1, true},
+		{"Season.02/Show - Ep 03 - Title.mkv", 2, 3, true},
+		{"Show.E02.mkv", 0, 0, false},
+	}
+	for _, tc := range cases {
+		s, e, ok := ParseEpisodeFromFilename(tc.name)
+		if s != tc.season || e != tc.episode || ok != tc.ok {
+			t.Fatalf("ParseEpisodeFromFilename(%q)=(%d,%d,%v), want (%d,%d,%v)", tc.name, s, e, ok, tc.season, tc.episode, tc.ok)
+		}
+	}
+}
+
+func TestSelectEpisodeFile_TargetMatchOnlyLargestMatch(t *testing.T) {
+	gb := int64(1024 * 1024 * 1024)
+	files := []FileStat{
+		{ID: 1, Path: "Show.S01E01.mkv", Length: 20 * gb},
+		{ID: 2, Path: "Show.S01E02.720p.mkv", Length: 2 * gb},
+		{ID: 3, Path: "Show.S01E02.1080p.mkv", Length: 5 * gb},
+		{ID: 5, Path: "Season 01/02 - Target From Pack.mkv", Length: 4 * gb},
+		{ID: 4, Path: "Show.S01E03.mkv", Length: 25 * gb},
+	}
+	got, ok := SelectEpisodeFile(files, 1, 2)
+	if !ok || got.ID != 3 {
+		t.Fatalf("SelectEpisodeFile got %+v ok=%v, want id=3", got, ok)
+	}
+	if _, ok := SelectEpisodeFile(files, 1, 4); ok {
+		t.Fatalf("expected no fallback to unrelated episode")
+	}
+}
+
 func TestBuildMovieFilename_Deterministic(t *testing.T) {
 	stream := MovieStreamMeta{
 		Title: "The Matrix 1080p HDR Atmos REMUX",

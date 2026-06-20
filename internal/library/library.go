@@ -83,6 +83,75 @@ func FilterEpisodeFiles(files []FileStat) []FileStat {
 	return out
 }
 
+var (
+	reTVEpNum       = regexp.MustCompile(`(?i)[Ss](\d+)[Ee](\d+)`)
+	reTV1xEp        = regexp.MustCompile(`(?i)(\d+)x(\d+)`)
+	reTVSeasonDir   = regexp.MustCompile(`(?i)(?:^|/)(?:season[ ._-]*|s)(\d{1,3})(?:/|$)`)
+	reTVEpisodeOnly = regexp.MustCompile(`(?i)(?:^|[\s._-])(?:e(?:p(?:isode)?)?[\s._-]*)?(\d{1,3})(?:[\s._-]|$)`)
+)
+
+// ParseEpisodeFromFilename extracts season/episode tokens from torrent
+// paths. It recognizes S01E02 and 1x02 forms, plus episode-only names
+// under Season folders (for example Season 01/01 - Pilot.mkv).
+func ParseEpisodeFromFilename(path string) (season int, episode int, ok bool) {
+	name := filepath.Base(path)
+	if m := reTVEpNum.FindStringSubmatch(name); len(m) == 3 {
+		_, _ = fmt.Sscanf(m[1], "%d", &season)
+		_, _ = fmt.Sscanf(m[2], "%d", &episode)
+		return season, episode, season > 0 && episode > 0
+	}
+	if m := reTV1xEp.FindStringSubmatch(name); len(m) == 3 {
+		_, _ = fmt.Sscanf(m[1], "%d", &season)
+		_, _ = fmt.Sscanf(m[2], "%d", &episode)
+		return season, episode, season > 0 && episode > 0
+	}
+
+	season = seasonFromPath(path)
+	if season <= 0 {
+		return 0, 0, false
+	}
+
+	for _, m := range reTVEpisodeOnly.FindAllStringSubmatch(name, -1) {
+		var ep int
+		_, _ = fmt.Sscanf(m[1], "%d", &ep)
+		if ep > 0 && ep <= 200 && ep != 480 && ep != 720 {
+			return season, ep, true
+		}
+	}
+
+	return 0, 0, false
+}
+
+func seasonFromPath(path string) int {
+	path = filepath.ToSlash(path)
+	if m := reTVSeasonDir.FindStringSubmatch(path); len(m) == 2 {
+		var season int
+		_, _ = fmt.Sscanf(m[1], "%d", &season)
+		return season
+	}
+	return 0
+}
+
+// SelectEpisodeFile returns the largest valid video file whose basename
+// matches the requested season/episode. It intentionally does not fall
+// back to the largest unrelated video file; season/series packs must not
+// create a valid-looking stub pointing at the wrong episode.
+func SelectEpisodeFile(files []FileStat, season, episode int) (FileStat, bool) {
+	var best FileStat
+	var found bool
+	for _, f := range FilterEpisodeFiles(files) {
+		fs, fe, ok := ParseEpisodeFromFilename(f.Path)
+		if !ok || fs != season || fe != episode {
+			continue
+		}
+		if !found || f.Length > best.Length {
+			best = f
+			found = true
+		}
+	}
+	return best, found
+}
+
 // MovieStreamMeta carries the minimum information BuildMovieFilename
 // needs from the source stream classification.
 type MovieStreamMeta struct {
@@ -92,11 +161,11 @@ type MovieStreamMeta struct {
 }
 
 var (
-	reMovHDR   = regexp.MustCompile(`(?i)\bhdr\b|hdr10\+?`)
-	reMovDV    = regexp.MustCompile(`(?i)\bdv\b|dovi|dolby.?vision`)
-	reMovAtmos = regexp.MustCompile(`(?i)atmos`)
-	reMov51    = regexp.MustCompile(`(?i)5\.1|dts|ddp5|ddp|dd\+|eac3|ac3`)
-	reMovRemux = regexp.MustCompile(`(?i)\bremux\b`)
+	reMovHDR       = regexp.MustCompile(`(?i)\bhdr\b|hdr10\+?`)
+	reMovDV        = regexp.MustCompile(`(?i)\bdv\b|dovi|dolby.?vision`)
+	reMovAtmos     = regexp.MustCompile(`(?i)atmos`)
+	reMov51        = regexp.MustCompile(`(?i)5\.1|dts|ddp5|ddp|dd\+|eac3|ac3`)
+	reMovRemux     = regexp.MustCompile(`(?i)\bremux\b`)
 	reMovTitleYear = regexp.MustCompile(`(.+?)[._\s]\(?((?:19|20)\d{2})\)?`)
 	reMovAlnum     = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 	reMovUnder     = regexp.MustCompile(`_+`)

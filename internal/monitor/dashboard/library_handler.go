@@ -106,7 +106,8 @@ var reMagnet4K = regexp.MustCompile(`(?i)2160p|4[kK]|uhd`)
 //  1. Validate method/content-type/body.
 //  2. AddTorrent → infohash.
 //  3. GetTorrentInfo bounded by cfg.TimeoutSec → 504 on timeout.
-//  4. Filter video files by movie/episode size band, pick largest.
+//  4. Filter video files by size band; movies pick largest, episodes
+//     pick largest file whose basename matches requested season/episode.
 //  5. Build canonical filename + stub path under PhysicalSourcePath.
 //  6. If stub already exists, return 409 with existing data (idempotent).
 //  7. Write stub via library.WriteStub.
@@ -136,12 +137,28 @@ func (h *LibraryHandler) Add(w http.ResponseWriter, r *http.Request) {
 	// idempotent re-request for an already-staged item never touches
 	// the torrent engine.
 	is4K := reMagnet4K.MatchString(req.Magnet)
+	for _, existingPath := range h.existingStubPaths(&req, is4K) {
+		if existing, err := library.ReadStub(existingPath); err == nil {
+			fusePath, err := library.RealToFuse(existingPath, h.cfg.PhysicalSourcePath, h.cfg.FuseMountPath)
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, "fuse_path_resolve: "+err.Error())
+				return
+			}
+			existingHash := library.HashFromStreamURL(existing.URL)
+			if existingHash == "" {
+				existingHash = library.HashFromMagnet(existing.Magnet)
+			}
+			writeJSON(w, http.StatusConflict, addResponse{
+				StubPath: existingPath,
+				FusePath: fusePath,
+				Hash:     existingHash,
+				Size:     existing.Size,
+			})
+			return
+		}
+	}
 
 	displayTitle := req.Title
-	if req.Type == "movie" {
-		// Movie filename needs the hash, which we don't have until
-		// AddTorrent returns. Defer stub-path computation until then.
-	}
 
 	ctx := r.Context()
 	hash, err := h.gostorm.AddTorrent(ctx, req.Magnet, displayTitle)
@@ -156,26 +173,32 @@ func (h *LibraryHandler) Add(w http.ResponseWriter, r *http.Request) {
 	timeout := h.cfg.TimeoutSec
 	files, err := h.gostorm.GetTorrentFiles(ctx, hash, timeout)
 	if err != nil {
-		_ = h.gostorm.RemoveTorrent(context.Background(), hash)
+		h.cleanupTorrentIfUnreferenced(hash)
 		writeJSONError(w, http.StatusGatewayTimeout, fmt.Sprintf("metadata_timeout: waited %ds (%s)", timeout, err.Error()))
 		return
 	}
 
-	var videoFiles []library.FileStat
+	var bestFile library.FileStat
 	if req.Type == "movie" {
-		videoFiles = library.FilterVideoFiles(files, is4K)
+		videoFiles := library.FilterVideoFiles(files, is4K)
+		if len(videoFiles) == 0 {
+			h.cleanupTorrentIfUnreferenced(hash)
+			writeJSONError(w, http.StatusUnprocessableEntity, "no_valid_files")
+			return
+		}
+		sort.Slice(videoFiles, func(i, j int) bool {
+			return videoFiles[i].Length > videoFiles[j].Length
+		})
+		bestFile = videoFiles[0]
 	} else {
-		videoFiles = library.FilterEpisodeFiles(files)
+		var ok bool
+		bestFile, ok = library.SelectEpisodeFile(files, req.Season, req.Episode)
+		if !ok {
+			h.cleanupTorrentIfUnreferenced(hash)
+			writeJSONError(w, http.StatusUnprocessableEntity, "target_episode_not_found")
+			return
+		}
 	}
-	if len(videoFiles) == 0 {
-		_ = h.gostorm.RemoveTorrent(context.Background(), hash)
-		writeJSONError(w, http.StatusUnprocessableEntity, "no_valid_files")
-		return
-	}
-	sort.Slice(videoFiles, func(i, j int) bool {
-		return videoFiles[i].Length > videoFiles[j].Length
-	})
-	bestFile := videoFiles[0]
 
 	// Re-derive is4K from the picked file size if magnet title didn't
 	// announce it — anything ≥ Movie4KMinBytes is treated as 4K.
@@ -201,27 +224,8 @@ func (h *LibraryHandler) Add(w http.ResponseWriter, r *http.Request) {
 
 	fusePath, err := library.RealToFuse(stubPath, h.cfg.PhysicalSourcePath, h.cfg.FuseMountPath)
 	if err != nil {
-		_ = h.gostorm.RemoveTorrent(context.Background(), hash)
+		h.cleanupTorrentIfUnreferenced(hash)
 		writeJSONError(w, http.StatusInternalServerError, "fuse_path_resolve: "+err.Error())
-		return
-	}
-
-	// Idempotency: if stub already on disk, return 409 with existing
-	// data so the caller can treat it as success.
-	if existing, err := library.ReadStub(stubPath); err == nil {
-		existingHash := library.HashFromStreamURL(existing.URL)
-		if existingHash == "" {
-			existingHash = library.HashFromMagnet(existing.Magnet)
-		}
-		writeJSON(w, http.StatusConflict, addResponse{
-			StubPath: stubPath,
-			FusePath: fusePath,
-			Hash:     existingHash,
-			Size:     existing.Size,
-		})
-		// Leave the torrent we just added in place — duplicate-add to
-		// gostorm with the same hash is a no-op there, and removing
-		// would yank the file out from under the existing stub.
 		return
 	}
 
@@ -229,7 +233,7 @@ func (h *LibraryHandler) Add(w http.ResponseWriter, r *http.Request) {
 		h.gostorm.BaseURL(), hash, bestFile.ID)
 
 	if err := library.WriteStub(stubPath, streamURL, bestFile.Length, req.Magnet, imdbForStub(&req)); err != nil {
-		_ = h.gostorm.RemoveTorrent(context.Background(), hash)
+		h.cleanupTorrentIfUnreferenced(hash)
 		writeJSONError(w, http.StatusInternalServerError, "write_stub: "+err.Error())
 		return
 	}
@@ -274,9 +278,10 @@ func (h *LibraryHandler) Remove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if hash != "" {
-		// Ignore "not found" — RemoveTorrent on a non-existent hash
-		// should not fail the idempotent remove.
-		_ = h.gostorm.RemoveTorrent(r.Context(), hash)
+		if err := h.gostorm.RemoveTorrent(r.Context(), hash); err != nil {
+			writeJSONError(w, http.StatusBadGateway, "remove_torrent: "+err.Error())
+			return
+		}
 	}
 
 	if err := os.Remove(req.StubPath); err != nil && !os.IsNotExist(err) {
@@ -285,6 +290,65 @@ func (h *LibraryHandler) Remove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *LibraryHandler) cleanupTorrentIfUnreferenced(hash string) {
+	if hash == "" || h.stubTreeReferencesHash(hash) {
+		return
+	}
+	_ = h.gostorm.RemoveTorrent(context.Background(), hash)
+}
+
+func (h *LibraryHandler) stubTreeReferencesHash(hash string) bool {
+	if strings.TrimSpace(h.cfg.PhysicalSourcePath) == "" {
+		return false
+	}
+	found := false
+	_ = filepath.WalkDir(h.cfg.PhysicalSourcePath, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || found || !library.IsVideoFile(path) {
+			return nil
+		}
+		stub, err := library.ReadStub(path)
+		if err != nil {
+			return nil
+		}
+		stubHash := library.HashFromStreamURL(stub.URL)
+		if stubHash == "" {
+			stubHash = library.HashFromMagnet(stub.Magnet)
+		}
+		if strings.EqualFold(stubHash, hash) {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+func (h *LibraryHandler) existingStubPaths(req *addRequest, is4K bool) []string {
+	hash := library.HashFromMagnet(req.Magnet)
+	switch req.Type {
+	case "movie":
+		releaseDate := fmt.Sprintf("%d-01-01", req.Year)
+		paths := []string{
+			filepath.Join(h.cfg.PhysicalSourcePath, "movies", library.BuildMovieFilename(req.Title, releaseDate, library.MovieStreamMeta{
+				Title: req.Title, Hash: hash, Is4K: is4K,
+			})),
+		}
+		if !is4K {
+			paths = append(paths, filepath.Join(h.cfg.PhysicalSourcePath, "movies", library.BuildMovieFilename(req.Title, releaseDate, library.MovieStreamMeta{
+				Title: req.Title, Hash: hash, Is4K: true,
+			})))
+		}
+		return paths
+	case "episode":
+		filename := library.BuildEpisodeFilename(req.Title, req.Season, req.Episode, hashSuffix(hash))
+		return []string{filepath.Join(
+			h.cfg.PhysicalSourcePath, "tv", req.SeriesIMDB,
+			fmt.Sprintf("Season.%02d", req.Season), filename,
+		)}
+	default:
+		return nil
+	}
 }
 
 func validateAdd(req *addRequest) error {
