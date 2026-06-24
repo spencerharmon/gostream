@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -86,7 +87,7 @@ func FilterEpisodeFiles(files []FileStat) []FileStat {
 var (
 	reTVEpNum       = regexp.MustCompile(`(?i)[Ss](\d+)[Ee](\d+)`)
 	reTV1xEp        = regexp.MustCompile(`(?i)(\d+)x(\d+)`)
-	reTVSeasonDir   = regexp.MustCompile(`(?i)(?:^|/)(?:season[ ._-]*|s)(\d{1,3})(?:/|$)`)
+	reTVSeasonDir   = regexp.MustCompile(`(?i)(?:^|[ ._-])(?:season[ ._-]*|s)(\d{1,3})(?:$|[ ._-])`)
 	reTVEpisodeOnly = regexp.MustCompile(`(?i)(?:^|[\s._-])(?:e(?:p(?:isode)?)?[\s._-]*)?(\d{1,3})(?:[\s._-]|$)`)
 )
 
@@ -124,10 +125,13 @@ func ParseEpisodeFromFilename(path string) (season int, episode int, ok bool) {
 
 func seasonFromPath(path string) int {
 	path = filepath.ToSlash(path)
-	if m := reTVSeasonDir.FindStringSubmatch(path); len(m) == 2 {
-		var season int
-		_, _ = fmt.Sscanf(m[1], "%d", &season)
-		return season
+	parts := strings.Split(path, "/")
+	for i := len(parts) - 2; i >= 0; i-- {
+		if m := reTVSeasonDir.FindStringSubmatch(parts[i]); len(m) == 2 {
+			var season int
+			_, _ = fmt.Sscanf(m[1], "%d", &season)
+			return season
+		}
 	}
 	return 0
 }
@@ -347,6 +351,22 @@ func HashFromStreamURL(streamURL string) string {
 		return ""
 	}
 	return strings.ToLower(m[1])
+}
+
+// StreamIndexFromURL parses the "index=<n>" query parameter out of a
+// stub's stream URL. Returns false if no non-negative index is present.
+var reStubIndexURL = regexp.MustCompile(`(?:[?&])index=([0-9]+)(?:&|$)`)
+
+func StreamIndexFromURL(streamURL string) (int, bool) {
+	m := reStubIndexURL.FindStringSubmatch(streamURL)
+	if len(m) < 2 {
+		return 0, false
+	}
+	idx, err := strconv.Atoi(m[1])
+	if err != nil || idx < 0 {
+		return 0, false
+	}
+	return idx, true
 }
 
 // HashFromMagnet extracts the 32-40 hex info hash out of a magnet URI.

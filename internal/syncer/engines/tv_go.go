@@ -101,34 +101,35 @@ const (
 )
 
 var (
-	reTV4K        = regexp.MustCompile(`(?i)2160p|4k|uhd`)
-	reTV1080p     = regexp.MustCompile(`(?i)1080p`)
-	reTVHDR       = regexp.MustCompile(`(?i)\bhdr\b|hdr10\+?|\bdv\b|dovi|dolby.?vision`)
-	reTVAtmos     = regexp.MustCompile(`(?i)atmos`)
-	reTV51        = regexp.MustCompile(`(?i)5\.1|dd5|ddp5|dts|truehd`)
-	reTVITA       = regexp.MustCompile(`(?i)ita|🇮🇹|multi|dual`)
-	reTVExclLang  = regexp.MustCompile(`🇪🇸|🇫🇷|🇩🇪|🇷🇺|🇨🇳|🇯🇵|🇰🇷|🇹🇭|🇵🇹|🇧🇷|🇺🇦|🇵🇱|🇳🇱|🇹🇷|🇸🇦|🇮🇳|🇨🇿|🇭🇺|🇷🇴`)
-	reTVSeeders   = regexp.MustCompile(`👤\s*(\d+)`)
+	reTV4K           = regexp.MustCompile(`(?i)2160p|4k|uhd`)
+	reTV1080p        = regexp.MustCompile(`(?i)1080p`)
+	reTVHDR          = regexp.MustCompile(`(?i)\bhdr\b|hdr10\+?|\bdv\b|dovi|dolby.?vision`)
+	reTVAtmos        = regexp.MustCompile(`(?i)atmos`)
+	reTV51           = regexp.MustCompile(`(?i)5\.1|dd5|ddp5|dts|truehd`)
+	reTVITA          = regexp.MustCompile(`(?i)ita|🇮🇹|multi|dual`)
+	reTVExclLang     = regexp.MustCompile(`🇪🇸|🇫🇷|🇩🇪|🇷🇺|🇨🇳|🇯🇵|🇰🇷|🇹🇭|🇵🇹|🇧🇷|🇺🇦|🇵🇱|🇳🇱|🇹🇷|🇸🇦|🇮🇳|🇨🇿|🇭🇺|🇷🇴`)
+	reTVSeeders      = regexp.MustCompile(`(?i)(?:👤\s*(\d+)|(\d+)\s*seeders?)`)
 	reTVFullpack     = regexp.MustCompile(`(?i)\b(season|complete|full|pack)\b`)
 	reTVRange        = regexp.MustCompile(`(?i)s\d+e\d+\s*-\s*e?\d+`)
 	reTVMultiEp      = regexp.MustCompile(`(?i)s\d+e\d+`)
 	reTVSeason       = regexp.MustCompile(`\.s\d{2}\.`)
 	reTVSeasonP      = regexp.MustCompile(`\ss\d{2}\s*\(`)
 	reTVSpecialTitle = regexp.MustCompile(`(?i)\b(special|christmas|bonus|extra|ova)\b`)
-	reTVSeasonN   = regexp.MustCompile(`[Ss](\d+)`)
-	reTVSeasonR   = regexp.MustCompile(`\bs(\d{1,2})\s*[-–]\s*s(\d{1,2})\b`)
-	reTVSeasonW   = regexp.MustCompile(`\bseasons?\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\b`)
-	reTVCompleteS = regexp.MustCompile(`(?i)\b(complete\s+series|all\s+seasons|full\s+series)\b`)
-	reTVEpNum     = regexp.MustCompile(`[Ss](\d+)[Ee](\d+)`)
-	reTV1xEp      = regexp.MustCompile(`(\d+)x(\d+)`)
-	reTVFileName  = regexp.MustCompile(`(.+)_S(\d+)E(\d+)_([a-f0-9]{8})\.mkv$`)
-	reTVNonWord   = regexp.MustCompile(`[^a-z0-9]`)
-	reTVSanitize  = regexp.MustCompile(`[<>:"/\\|?*'"&]`)
-	reTVSpaces    = regexp.MustCompile(`\s+`)
-	reTVUnders    = regexp.MustCompile(`_+`)
-	reTVYear      = regexp.MustCompile(`\(?(\d{4})\)?`)
-	reTVQuality   = regexp.MustCompile(`\b(2160p|1080p|720p|4k|uhd|hdr|dv|dovi|web|bluray|remux)\b.*`)
-	reTVHashURL   = regexp.MustCompile(`link=([a-f0-9]{40})`)
+	reTVSeasonN      = regexp.MustCompile(`[Ss](\d+)`)
+	reTVSeasonSingle = regexp.MustCompile(`(?i)\bseason[ ._-]*(\d{1,3})\b`)
+	reTVSeasonR      = regexp.MustCompile(`\bs(\d{1,2})\s*(?:[-–]|to)\s*s(\d{1,2})\b`)
+	reTVSeasonW      = regexp.MustCompile(`\bseasons?\s*(\d{1,2})\s*(?:[-–]|to)\s*(\d{1,2})\b`)
+	reTVCompleteS    = regexp.MustCompile(`(?i)\b(complete\s+series|all\s+seasons|full\s+series)\b`)
+	reTVEpNum        = regexp.MustCompile(`[Ss](\d+)[Ee](\d+)`)
+	reTV1xEp         = regexp.MustCompile(`(\d+)x(\d+)`)
+	reTVFileName     = regexp.MustCompile(`(.+)_S(\d+)E(\d+)_([a-f0-9]{8})\.mkv$`)
+	reTVNonWord      = regexp.MustCompile(`[^a-z0-9]`)
+	reTVSanitize     = regexp.MustCompile(`[<>:"/\\|?*'"&]`)
+	reTVSpaces       = regexp.MustCompile(`\s+`)
+	reTVUnders       = regexp.MustCompile(`_+`)
+	reTVYear         = regexp.MustCompile(`\(?(\d{4})\)?`)
+	reTVQuality      = regexp.MustCompile(`\b(2160p|1080p|720p|4k|uhd|hdr|dv|dovi|web|bluray|remux)\b.*`)
+	reTVHashURL      = regexp.MustCompile(`link=([a-f0-9]{40})`)
 )
 
 var tvExcludedGenreIDs = map[int]bool{99: true, 10763: true, 10764: true, 10767: true, 16: true}
@@ -621,33 +622,25 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 		if !stream.IsFullpack {
 			continue
 		}
-		if skippedSeasons[stream.Season] {
-			continue
-		}
-		if seasonsComplete[stream.Season] {
-			continue
-		}
-		// Pre-check: if season is already complete in registry at equal/lower quality, skip
-		// without fetching torrent info (AddTorrent + GetTorrentInfo can take up to 90s).
-		if avgScore, isComplete := completeSeasons[stream.Season]; isComplete {
-			if float64(stream.QualityScore) <= avgScore*tvUpgradeThreshold {
-				e.logger.Printf("    fullpack S%02d: already complete (registry avg=%.0f, stream=%d) — skipped", stream.Season, avgScore, stream.QualityScore)
-				continue
-			}
-		}
 
 		t2 := time.Now()
-		count := e.processFullpack(ctx, showName, stream, show.FirstAirDate)
+		counts := e.processFullpack(ctx, showName, stream, show.FirstAirDate, startSeason, endSeason, skippedSeasons, seasonsComplete, tmdbSeasonEps)
+		count := 0
+		for _, seasonCount := range counts {
+			count += seasonCount
+		}
 		e.logger.Printf("    fullpack S%02d: %d created in %v (%s)", stream.Season, count, time.Since(t2).Round(time.Millisecond), stream.Title[:min(60, len(stream.Title))])
 		if count > 0 {
 			created += count
-			seasonsEpCount[stream.Season] += count
-			expected := tmdbSeasonEps[stream.Season]
-			total := seasonsEpCount[stream.Season]
-			if expected > 0 && total >= expected {
-				seasonsComplete[stream.Season] = true
-			} else if !stream.IsPartialPack && expected == 0 && count >= 5 {
-				seasonsComplete[stream.Season] = true
+			for season, seasonCount := range counts {
+				seasonsEpCount[season] += seasonCount
+				expected := tmdbSeasonEps[season]
+				total := seasonsEpCount[season]
+				if expected > 0 && total >= expected {
+					seasonsComplete[season] = true
+				} else if !stream.IsPartialPack && expected == 0 && seasonCount >= 5 {
+					seasonsComplete[season] = true
+				}
 			}
 		}
 	}
@@ -788,7 +781,7 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 		if c == nil {
 			continue
 		}
-		if c.Season < startSeason || c.Season > endSeason {
+		if !e.streamOverlapsSeasonWindow(c, startSeason, endSeason) {
 			continue
 		}
 		// Reject single-episode streams beyond TMDB's canonical episode count
@@ -797,14 +790,18 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 				continue
 			}
 		}
-		span := e.extractSeasonSpan(c.Title)
-		if span != nil && span[0] < startSeason {
-			continue
-		}
 		classified = append(classified, *c)
 	}
 
 	return classified
+}
+
+func (e *TVGoEngine) streamOverlapsSeasonWindow(c *TVStream, startSeason, endSeason int) bool {
+	span := e.extractSeasonSpan(c.Title)
+	if span != nil {
+		return span[0] <= endSeason && span[1] >= startSeason
+	}
+	return c.Season >= startSeason && c.Season <= endSeason
 }
 
 func (e *TVGoEngine) classifyStream(s prowlarr.Stream) *TVStream {
@@ -919,6 +916,9 @@ func (e *TVGoEngine) isFullpack(title string) bool {
 	firstLine := strings.Split(title, "\n")[0]
 	t := strings.ToLower(firstLine)
 
+	if e.extractSeasonSpan(title) != nil {
+		return true
+	}
 	if reTVFullpack.MatchString(t) {
 		return true
 	}
@@ -944,6 +944,11 @@ func (e *TVGoEngine) isFullpack(title string) bool {
 
 func (e *TVGoEngine) extractSeason(title string) int {
 	m := reTVSeasonN.FindStringSubmatch(title)
+	if len(m) > 1 {
+		n, _ := strconv.Atoi(m[1])
+		return n
+	}
+	m = reTVSeasonSingle.FindStringSubmatch(title)
 	if len(m) > 1 {
 		n, _ := strconv.Atoi(m[1])
 		return n
@@ -983,52 +988,80 @@ func (e *TVGoEngine) extractSeasonSpan(title string) *[2]int {
 
 func (e *TVGoEngine) extractSeeders(title string) int {
 	m := reTVSeeders.FindStringSubmatch(title)
-	if len(m) > 1 {
-		n, _ := strconv.Atoi(m[1])
+	if len(m) < 2 {
+		return 0
+	}
+	for _, group := range m[1:] {
+		if group == "" {
+			continue
+		}
+		n, _ := strconv.Atoi(group)
 		return n
 	}
 	return 0
 }
 
-func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, stream TVStream, firstAirDate string) int {
+func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, stream TVStream, firstAirDate string, startSeason, endSeason int, skippedSeasons, seasonsComplete map[int]bool, tmdbSeasonEps map[int]int) map[int]int {
+	createdBySeason := make(map[int]int)
 	magnet := BuildMagnet(stream.Hash, stream.Title, DefaultTrackers())
 	hash, err := e.gostorm.AddTorrent(ctx, magnet, stream.Title)
 	if err != nil || hash == "" {
-		return 0
+		return createdBySeason
 	}
 
 	info, err := e.gostorm.GetTorrentInfo(ctx, hash, 90)
 	if err != nil {
 		e.gostorm.RemoveTorrent(ctx, hash)
-		return 0
+		return createdBySeason
 	}
 
-	var videoFiles []FileStat
-	for _, f := range info.FileStats {
-		if e.isVideoFile(f.Path) {
-			if f.Length >= tvMinEpisodeSize && f.Length <= tvMaxEpisodeSize {
-				videoFiles = append(videoFiles, f)
-			}
-		}
-	}
+	videoFiles := library.FilterEpisodeFiles(info.FileStats)
 
 	if len(videoFiles) == 0 {
 		e.gostorm.RemoveTorrent(ctx, hash)
-		return 0
+		return createdBySeason
+	}
+
+	type episodeFileKey struct {
+		Season  int
+		Episode int
+	}
+	bestFiles := make(map[episodeFileKey]FileStat)
+	for _, vf := range videoFiles {
+		season, episode, ok := library.ParseEpisodeFromFilename(vf.Path)
+		if !ok {
+			continue
+		}
+		if season < startSeason || season > endSeason || skippedSeasons[season] || seasonsComplete[season] {
+			continue
+		}
+		if maxEp, ok := tmdbSeasonEps[season]; ok && maxEp > 0 && episode > maxEp {
+			continue
+		}
+		key := episodeFileKey{Season: season, Episode: episode}
+		if existing, ok := bestFiles[key]; !ok || vf.Length > existing.Length {
+			bestFiles[key] = vf
+		}
 	}
 
 	created := 0
 	skipped := 0
 	cleanShow := e.getShowFolderName(showName, firstAirDate)
 
-	for _, vf := range videoFiles {
-		filename := filepath.Base(vf.Path)
-		epInfo := e.extractEpisodeFromFilename(filename)
-		if epInfo[0] == 0 && epInfo[1] == 0 {
-			continue
+	keys := make([]episodeFileKey, 0, len(bestFiles))
+	for key := range bestFiles {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Season != keys[j].Season {
+			return keys[i].Season < keys[j].Season
 		}
+		return keys[i].Episode < keys[j].Episode
+	})
 
-		season, episode := epInfo[0], epInfo[1]
+	for _, fileKey := range keys {
+		season, episode := fileKey.Season, fileKey.Episode
+		vf := bestFiles[fileKey]
 		key := e.episodeKey(showName, season, episode)
 
 		if e.processedThisRun[key] {
@@ -1039,7 +1072,6 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 			if float64(stream.QualityScore) <= float64(existing.QualityScore)*tvUpgradeThreshold {
 				e.stats.EpisodesSkipped++
 				skipped++
-				e.processedThisRun[key] = true
 				continue
 			}
 		}
@@ -1057,6 +1089,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 			e.registerEpisode(key, stream.QualityScore, hash, epPath, "fullpack")
 			e.processedThisRun[key] = true
 			created++
+			createdBySeason[season]++
 			e.logger.Printf("Created: %s", epFilename)
 		}
 	}
@@ -1064,11 +1097,20 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 	if skipped > 0 && created == 0 {
 		e.logger.Printf("  fullpack skipped: %d/%d eps already at sufficient quality (score %d)", skipped, len(videoFiles), stream.QualityScore)
 	}
-	if created == 0 {
+	if created == 0 && skipped == 0 && !e.registryReferencesHash(hash) {
 		e.gostorm.RemoveTorrent(ctx, hash)
 	}
 
-	return created
+	return createdBySeason
+}
+
+func (e *TVGoEngine) registryReferencesHash(hash string) bool {
+	for _, entry := range e.registry {
+		if strings.EqualFold(entry.Hash, hash) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream TVStream, firstAirDate string) int {
@@ -1089,7 +1131,6 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream 
 	if existing, ok := e.registry[key]; ok {
 		if float64(stream.QualityScore) <= float64(existing.QualityScore)*tvUpgradeThreshold {
 			e.stats.EpisodesSkipped++
-			e.processedThisRun[key] = true
 			e.logger.Printf("  Skip S%02dE%02d: score %d <= existing %d (threshold %.0f)", season, episode, stream.QualityScore, existing.QualityScore, float64(existing.QualityScore)*tvUpgradeThreshold)
 			return 0
 		}
@@ -1107,17 +1148,8 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream 
 		return 0
 	}
 
-	var bestFile *FileStat
-	for i := range info.FileStats {
-		f := &info.FileStats[i]
-		if e.isVideoFile(f.Path) && f.Length >= tvMinEpisodeSize {
-			if bestFile == nil || f.Length > bestFile.Length {
-				cp := *f
-				bestFile = &cp
-			}
-		}
-	}
-	if bestFile == nil {
+	bestFile, ok := library.SelectEpisodeFile(info.FileStats, season, episode)
+	if !ok {
 		e.gostorm.RemoveTorrent(ctx, hash)
 		return 0
 	}
@@ -1356,7 +1388,7 @@ func (e *TVGoEngine) cleanupOrphanedTorrents(ctx context.Context) {
 		return nil
 	})
 
-	reTVSeries := regexp.MustCompile(`(?i)s\d+e\d+|season|episode`)
+	reTVSeries := regexp.MustCompile(`(?i)s\d+e\d+|season|episode|complete|full|pack|\bs\d{1,2}\s*(?:[-–]|to)\s*s\d{1,2}\b`)
 	removed := 0
 
 	for _, t := range torrents {
@@ -1409,4 +1441,3 @@ func (e *TVGoEngine) getShowFolderName(showName, firstAirDate string) string {
 func (e *TVGoEngine) buildFilename(show string, season, episode int, hash8 string) string {
 	return library.BuildEpisodeFilename(show, season, episode, hash8)
 }
-

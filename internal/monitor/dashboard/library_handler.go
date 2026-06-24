@@ -139,6 +139,12 @@ func (h *LibraryHandler) Add(w http.ResponseWriter, r *http.Request) {
 	is4K := reMagnet4K.MatchString(req.Magnet)
 	for _, existingPath := range h.existingStubPaths(&req, is4K) {
 		if existing, err := library.ReadStub(existingPath); err == nil {
+			if req.Type == "episode" && !h.existingEpisodeStubMatches(r.Context(), existing, &req) {
+				// Existing pre-patch episode stubs may point at the largest file in
+				// a season/series pack instead of the requested episode. Leave the
+				// old stub in place until the replacement write succeeds below.
+				break
+			}
 			fusePath, err := library.RealToFuse(existingPath, h.cfg.PhysicalSourcePath, h.cfg.FuseMountPath)
 			if err != nil {
 				writeJSONError(w, http.StatusInternalServerError, "fuse_path_resolve: "+err.Error())
@@ -268,6 +274,11 @@ func (h *LibraryHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.pathUnderPhysicalRoot(req.StubPath) {
+		writeJSONError(w, http.StatusBadRequest, "stub_path outside physical source path")
+		return
+	}
+
 	// Read stub (best effort) to recover the hash.
 	var hash string
 	if stub, err := library.ReadStub(req.StubPath); err == nil {
@@ -277,7 +288,7 @@ func (h *LibraryHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if hash != "" {
+	if hash != "" && !h.stubTreeReferencesHashExcept(hash, req.StubPath) {
 		if err := h.gostorm.RemoveTorrent(r.Context(), hash); err != nil {
 			writeJSONError(w, http.StatusBadGateway, "remove_torrent: "+err.Error())
 			return
@@ -292,6 +303,22 @@ func (h *LibraryHandler) Remove(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *LibraryHandler) pathUnderPhysicalRoot(path string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	absRoot, err := filepath.Abs(h.cfg.PhysicalSourcePath)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
 func (h *LibraryHandler) cleanupTorrentIfUnreferenced(hash string) {
 	if hash == "" || h.stubTreeReferencesHash(hash) {
 		return
@@ -299,29 +326,86 @@ func (h *LibraryHandler) cleanupTorrentIfUnreferenced(hash string) {
 	_ = h.gostorm.RemoveTorrent(context.Background(), hash)
 }
 
+func (h *LibraryHandler) existingEpisodeStubMatches(ctx context.Context, stub *library.Stub, req *addRequest) bool {
+	hash := library.HashFromStreamURL(stub.URL)
+	if hash == "" {
+		hash = library.HashFromMagnet(stub.Magnet)
+	}
+	if hash == "" {
+		return false
+	}
+
+	index, ok := library.StreamIndexFromURL(stub.URL)
+	if !ok {
+		return false
+	}
+
+	files, err := h.gostorm.GetTorrentFiles(ctx, hash, h.cfg.TimeoutSec)
+	if err != nil {
+		return false
+	}
+
+	for _, f := range files {
+		if f.ID != index {
+			continue
+		}
+		season, episode, ok := library.ParseEpisodeFromFilename(f.Path)
+		if !ok || season != req.Season || episode != req.Episode {
+			return false
+		}
+		return stub.Size == f.Length
+	}
+
+	return false
+}
+
 func (h *LibraryHandler) stubTreeReferencesHash(hash string) bool {
+	return h.stubTreeReferencesHashExcept(hash, "")
+}
+
+func (h *LibraryHandler) stubTreeReferencesHashExcept(hash, excludedPath string) bool {
 	if strings.TrimSpace(h.cfg.PhysicalSourcePath) == "" {
 		return false
+	}
+	absExcluded := ""
+	if excludedPath != "" {
+		absExcluded, _ = filepath.Abs(excludedPath)
 	}
 	found := false
 	_ = filepath.WalkDir(h.cfg.PhysicalSourcePath, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || found || !library.IsVideoFile(path) {
 			return nil
 		}
-		stub, err := library.ReadStub(path)
-		if err != nil {
-			return nil
+		if absExcluded != "" {
+			absPath, err := filepath.Abs(path)
+			if err == nil && absPath == absExcluded {
+				return nil
+			}
 		}
-		stubHash := library.HashFromStreamURL(stub.URL)
-		if stubHash == "" {
-			stubHash = library.HashFromMagnet(stub.Magnet)
-		}
+		stubHash := hashFromStubFile(path)
 		if strings.EqualFold(stubHash, hash) {
 			found = true
 		}
 		return nil
 	})
 	return found
+}
+
+func hashFromStubFile(path string) string {
+	if stub, err := library.ReadStub(path); err == nil {
+		stubHash := library.HashFromStreamURL(stub.URL)
+		if stubHash == "" {
+			stubHash = library.HashFromMagnet(stub.Magnet)
+		}
+		return stubHash
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	firstLine := strings.SplitN(string(raw), "\n", 2)[0]
+	return library.HashFromStreamURL(firstLine)
 }
 
 func (h *LibraryHandler) existingStubPaths(req *addRequest, is4K bool) []string {

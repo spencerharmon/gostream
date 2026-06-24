@@ -99,6 +99,10 @@ func TestParseEpisodeFromFilename(t *testing.T) {
 		{"Show.S01E02.sample.txt", 1, 2, true},
 		{"Season 01/01 - Pilot.mkv", 1, 1, true},
 		{"Season.02/Show - Ep 03 - Title.mkv", 2, 3, true},
+		{"Show.S02.1080p/03 - Return to Omashu.mkv", 2, 3, true},
+		{"Show S01-S03/Season 02/03 - Return to Omashu.mkv", 2, 3, true},
+		{"[Avatar Realms] Avatar The last airbender 1080p MULTI VF-VO-VOSTFR/Book 2 - Earth (Livre 2 - La terre)/[Avatar Realms] Avatar The Last Airbender 2x03 Return to Omashu [x264 FHD multi sub FR].mkv", 2, 3, true},
+		{"[Avatar Realms] Avatar The last airbender 1080p MULTI VF-VO-VOSTFR/Book 2 - Earth (Livre 2 - La terre)/03 - Return to Omashu [x264 FHD multi sub FR].mkv", 0, 0, false},
 		{"Show.E02.mkv", 0, 0, false},
 	}
 	for _, tc := range cases {
@@ -194,6 +198,19 @@ func TestHashFromStreamURL(t *testing.T) {
 	}
 	if HashFromStreamURL("http://host/none") != "" {
 		t.Errorf("expected empty")
+	}
+}
+
+func TestStreamIndexFromURL(t *testing.T) {
+	idx, ok := StreamIndexFromURL("http://host/stream?link=abcdef0123456789abcdef0123456789abcdef01&index=31&play")
+	if !ok || idx != 31 {
+		t.Fatalf("StreamIndexFromURL got (%d,%v), want (31,true)", idx, ok)
+	}
+	if _, ok := StreamIndexFromURL("http://host/stream?index=-1"); ok {
+		t.Fatalf("negative index should not parse")
+	}
+	if _, ok := StreamIndexFromURL("http://host/stream?link=abc"); ok {
+		t.Fatalf("missing index should not parse")
 	}
 }
 
