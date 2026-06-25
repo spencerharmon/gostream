@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,17 +24,26 @@ type fakeGoStorm struct {
 	addedTitle  string
 	addCalls    int
 	getCalls    int
+	addErr      error
+	filesErr    error
+	probeErr    error
 }
 
 func (f *fakeGoStorm) AddTorrent(ctx context.Context, magnet, title string) (string, error) {
 	f.addCalls++
 	f.addedMagnet = magnet
 	f.addedTitle = title
+	if f.addErr != nil {
+		return "", f.addErr
+	}
 	return library.HashFromMagnet(magnet), nil
 }
 
 func (f *fakeGoStorm) GetTorrentFiles(ctx context.Context, hash string, maxWaitSec int) ([]library.FileStat, error) {
 	f.getCalls++
+	if f.filesErr != nil {
+		return nil, f.filesErr
+	}
 	return f.files, nil
 }
 
@@ -43,6 +53,9 @@ func (f *fakeGoStorm) RemoveTorrent(ctx context.Context, hash string) error {
 }
 
 func (f *fakeGoStorm) ProbeAudio(ctx context.Context, hash string, fileID int, maxWaitSec int) ([]library.AudioTrack, error) {
+	if f.probeErr != nil {
+		return nil, f.probeErr
+	}
 	return f.audioTracks, nil
 }
 
@@ -170,6 +183,95 @@ func TestLibraryAdd_RevalidatesSelectedFileAudioHints(t *testing.T) {
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestLibraryValidate_AudioProbeFailureIsTransient(t *testing.T) {
+	gb := int64(1024 * 1024 * 1024)
+	magnet := "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01"
+	gs := &fakeGoStorm{files: []library.FileStat{{ID: 12, Path: "Show.S02E01.mkv", Length: 5 * gb}}, probeErr: errors.New("probe failed")}
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir(), TimeoutSec: 1}, gs)
+	body := baseEpisodeRequest(magnet)
+	body["title"] = "Show"
+	body["series_imdb"] = "tt123"
+
+	rr := postValidate(t, h, body)
+	var resp validateResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != "transient" || resp.Reason == nil || *resp.Reason != "audio_probe_failed" {
+		t.Fatalf("response=%+v body=%s", resp, rr.Body.String())
+	}
+}
+
+func TestLibraryValidate_MetadataCancelIsTransientCancelled(t *testing.T) {
+	magnet := "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01"
+	gs := &fakeGoStorm{filesErr: context.Canceled}
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir(), TimeoutSec: 1}, gs)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	raw, err := json.Marshal(baseEpisodeRequest(magnet))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/library/validate", bytes.NewReader(raw)).WithContext(ctx)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.Validate(rr, req)
+	var resp validateResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Code != http.StatusOK || resp.Status != "transient" || resp.Reason == nil || *resp.Reason != "validation_cancelled" {
+		t.Fatalf("status=%d response=%+v body=%s", rr.Code, resp, rr.Body.String())
+	}
+}
+
+func TestLibraryValidate_ExpiredLeaseCleanupRemovesOnlyUnreferenced(t *testing.T) {
+	hash := "abcdef0123456789abcdef0123456789abcdef01"
+	gs := &fakeGoStorm{}
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir()}, gs)
+	h.storeLease("expired", hash, library.FileStat{ID: 1}, nil, time.Now().Add(-time.Minute))
+	h.cleanupExpiredValidationLeases()
+	if gs.removedHash != hash {
+		t.Fatalf("expected expired unreferenced lease cleanup, got %q", gs.removedHash)
+	}
+
+	gs = &fakeGoStorm{}
+	h = NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir()}, gs)
+	h.storeLease("expired", hash, library.FileStat{ID: 1}, nil, time.Now().Add(-time.Minute))
+	h.storeLease("active", hash, library.FileStat{ID: 1}, nil, time.Now().Add(time.Minute))
+	h.cleanupExpiredValidationLeases()
+	if gs.removedHash != "" {
+		t.Fatalf("must preserve hash with active validation lease, removed %q", gs.removedHash)
+	}
+}
+
+func TestLibraryAuth_AllProtectedEndpointsRejectNonLoopbackWithoutToken(t *testing.T) {
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir()}, &fakeGoStorm{})
+	endpoints := []struct {
+		name string
+		body string
+		call func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "add", body: `{"type":"movie","title":"Movie","year":2024,"tmdb":1,"magnet":"magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01"}`, call: h.Add},
+		{name: "remove", body: `{"stub_path":"/tmp/x.mkv"}`, call: h.Remove},
+		{name: "validate", body: `{"type":"movie","title":"Movie","year":2024,"tmdb":1,"magnet":"magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01","validation_session_id":"s"}`, call: h.Validate},
+		{name: "release", body: `{"validation_session_id":"s","hash":"abcdef0123456789abcdef0123456789abcdef01"}`, call: h.ReleaseValidation},
+	}
+	for _, ep := range endpoints {
+		t.Run(ep.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/library/"+ep.name, bytes.NewReader([]byte(ep.body)))
+			req.RemoteAddr = "203.0.113.10:1234"
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			ep.call(rr, req)
+			if rr.Code != http.StatusForbidden {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+		})
 	}
 }
 

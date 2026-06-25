@@ -16,6 +16,11 @@ func TestSelectPreferredMainAudioEnglishHeuristics(t *testing.T) {
 			wantOK: true, wantIndex: 3,
 		},
 		{
+			name:   "structured en language accepted",
+			tracks: []AudioTrack{{StreamIndex: 4, Language: "en", Title: "Main", Codec: "aac"}},
+			wantOK: true, wantIndex: 4,
+		},
+		{
 			name:   "bare en free text forbidden",
 			tracks: []AudioTrack{{StreamIndex: 3, Title: "Audio en Espanol", Codec: "aac"}},
 			wantOK: false,
@@ -23,6 +28,11 @@ func TestSelectPreferredMainAudioEnglishHeuristics(t *testing.T) {
 		{
 			name:   "substring poleng forbidden",
 			tracks: []AudioTrack{{StreamIndex: 3, Title: "poleng", Codec: "aac"}},
+			wantOK: false,
+		},
+		{
+			name:   "substring denoise forbidden",
+			tracks: []AudioTrack{{StreamIndex: 3, Title: "denoise", Codec: "aac"}},
 			wantOK: false,
 		},
 		{

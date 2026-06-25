@@ -204,6 +204,7 @@ func (h *LibraryHandler) Add(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r) {
 		return
 	}
+	h.cleanupExpiredValidationLeases()
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
@@ -343,6 +344,7 @@ func (h *LibraryHandler) Validate(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r) {
 		return
 	}
+	h.cleanupExpiredValidationLeases()
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
@@ -377,6 +379,9 @@ func (h *LibraryHandler) Validate(w http.ResponseWriter, r *http.Request) {
 			err = errors.New("empty hash")
 		}
 		reason := "torrent_engine_busy"
+		if errors.Is(ctx.Err(), context.Canceled) {
+			reason = "validation_cancelled"
+		}
 		writeJSON(w, http.StatusOK, validationFailure("transient", reason, hash, req.ValidationSessionID, timings, started))
 		return
 	}
@@ -387,6 +392,9 @@ func (h *LibraryHandler) Validate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.cleanupTorrentIfUnreferenced(hash)
 		reason := "metadata_timeout"
+		if errors.Is(ctx.Err(), context.Canceled) {
+			reason = "validation_cancelled"
+		}
 		writeJSON(w, http.StatusOK, validationFailure("transient", reason, hash, req.ValidationSessionID, timings, started))
 		return
 	}
@@ -435,6 +443,7 @@ func (h *LibraryHandler) ReleaseValidation(w http.ResponseWriter, r *http.Reques
 	if !h.authorize(w, r) {
 		return
 	}
+	h.cleanupExpiredValidationLeases()
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
@@ -585,10 +594,23 @@ func (h *LibraryHandler) hashHasValidationLease(hash string) bool {
 
 func (h *LibraryHandler) expireLeasesLocked(now time.Time) {
 	for key, lease := range h.leases {
-		if now.After(lease.ExpiresAt) {
+		if !lease.ExpiresAt.After(now) {
 			delete(h.leases, key)
 		}
 	}
+}
+
+func (h *LibraryHandler) takeExpiredLeases(now time.Time) []*validationLease {
+	h.leasesMu.Lock()
+	defer h.leasesMu.Unlock()
+	var expired []*validationLease
+	for key, lease := range h.leases {
+		if !lease.ExpiresAt.After(now) {
+			expired = append(expired, lease)
+			delete(h.leases, key)
+		}
+	}
+	return expired
 }
 
 // Remove handles POST /api/library/remove. Idempotent: missing torrent
@@ -597,6 +619,7 @@ func (h *LibraryHandler) Remove(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r) {
 		return
 	}
+	h.cleanupExpiredValidationLeases()
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
@@ -666,6 +689,12 @@ func (h *LibraryHandler) cleanupTorrentIfUnreferenced(hash string) {
 		return
 	}
 	_ = h.gostorm.RemoveTorrent(context.Background(), hash)
+}
+
+func (h *LibraryHandler) cleanupExpiredValidationLeases() {
+	for _, lease := range h.takeExpiredLeases(time.Now()) {
+		h.cleanupTorrentIfUnreferenced(lease.Hash)
+	}
 }
 
 func (h *LibraryHandler) existingEpisodeStubMatches(ctx context.Context, stub *library.Stub, req *addRequest) bool {
