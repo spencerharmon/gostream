@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"gostream/internal/library"
 )
@@ -26,6 +29,7 @@ type GoStormClient interface {
 	// timeout or context cancellation.
 	GetTorrentFiles(ctx context.Context, hash string, maxWaitSec int) ([]library.FileStat, error)
 	RemoveTorrent(ctx context.Context, hash string) error
+	ProbeAudio(ctx context.Context, hash string, fileID int, maxWaitSec int) ([]library.AudioTrack, error)
 	BaseURL() string
 }
 
@@ -43,12 +47,25 @@ type LibraryConfig struct {
 	PhysicalSourcePath string // real movies/tv root (config.PhysicalSourcePath)
 	FuseMountPath      string // FUSE virtual mount root (config.FuseMountPath)
 	TimeoutSec         int    // server-side metadata wait, default 45
+	AuthToken          string // optional X-Gostream-Token shared secret
+	ValidationLeaseMin int    // validation lease minutes, default 10
 }
 
 // LibraryHandler serves POST /api/library/add and /api/library/remove.
 type LibraryHandler struct {
 	cfg     LibraryConfig
 	gostorm GoStormClient
+
+	leasesMu sync.Mutex
+	leases   map[string]*validationLease
+}
+
+type validationLease struct {
+	SessionID string
+	Hash      string
+	File      library.FileStat
+	Tracks    []library.AudioTrack
+	ExpiresAt time.Time
 }
 
 // NewLibraryHandler constructs a handler. Both args are required and
@@ -57,7 +74,16 @@ func NewLibraryHandler(cfg LibraryConfig, gs GoStormClient) *LibraryHandler {
 	if cfg.TimeoutSec <= 0 {
 		cfg.TimeoutSec = 45
 	}
-	return &LibraryHandler{cfg: cfg, gostorm: gs}
+	if cfg.ValidationLeaseMin <= 0 {
+		cfg.ValidationLeaseMin = 10
+	}
+	if cfg.ValidationLeaseMin < 1 {
+		cfg.ValidationLeaseMin = 1
+	}
+	if cfg.ValidationLeaseMin > 60 {
+		cfg.ValidationLeaseMin = 60
+	}
+	return &LibraryHandler{cfg: cfg, gostorm: gs, leases: map[string]*validationLease{}}
 }
 
 type addRequest struct {
@@ -71,6 +97,12 @@ type addRequest struct {
 	SeriesIMDB string `json:"series_imdb"`
 	Magnet     string `json:"magnet"`
 	MinQuality string `json:"min_quality"` // TODO(follow-up): honor quality floor
+
+	RequiredAudioLanguages []string `json:"required_audio_languages"`
+	PreferredAudioLanguage string   `json:"preferred_audio_language"`
+	ValidationSessionID    string   `json:"validation_session_id"`
+	SelectedFileID         *int     `json:"selected_file_id"`
+	SelectedFilePath       string   `json:"selected_file_path"`
 }
 
 type addResponse struct {
@@ -78,6 +110,38 @@ type addResponse struct {
 	FusePath string `json:"fuse_path"`
 	Hash     string `json:"hash"`
 	Size     int64  `json:"size"`
+}
+
+type selectedFileResponse struct {
+	ID   int    `json:"id"`
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+}
+
+type validationTimings struct {
+	AddTorrent   int64 `json:"add_torrent"`
+	MetadataWait int64 `json:"metadata_wait"`
+	FileSelect   int64 `json:"file_select"`
+	AudioProbe   int64 `json:"audio_probe"`
+	Total        int64 `json:"total"`
+}
+
+type validateResponse struct {
+	Status                   string                `json:"status"`
+	Reason                   *string               `json:"reason"`
+	Hash                     string                `json:"hash"`
+	SelectedFile             *selectedFileResponse `json:"selected_file,omitempty"`
+	AudioTracks              []library.AudioTrack  `json:"audio_tracks,omitempty"`
+	SelectedAudioIndex       *int                  `json:"selected_audio_index,omitempty"`
+	SelectedAudioLanguage    string                `json:"selected_audio_language,omitempty"`
+	ValidationSessionID      string                `json:"validation_session_id"`
+	ValidationLeaseExpiresAt *time.Time            `json:"validation_lease_expires_at,omitempty"`
+	TimingsMS                validationTimings     `json:"timings_ms"`
+}
+
+type releaseRequest struct {
+	ValidationSessionID string `json:"validation_session_id"`
+	Hash                string `json:"hash"`
 }
 
 type removeRequest struct {
@@ -94,6 +158,30 @@ func writeJSON(w http.ResponseWriter, status int, body interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+func (h *LibraryHandler) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if h.cfg.AuthToken != "" {
+		if r.Header.Get("X-Gostream-Token") != h.cfg.AuthToken {
+			writeJSONError(w, http.StatusUnauthorized, "missing_or_invalid_token")
+			return false
+		}
+		return true
+	}
+	if isLoopbackRequest(r) {
+		return true
+	}
+	writeJSONError(w, http.StatusForbidden, "loopback_required_when_token_unset")
+	return false
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // reMagnetTitle pulls the dn= value out of a magnet URI, used to infer
@@ -113,6 +201,9 @@ var reMagnet4K = regexp.MustCompile(`(?i)2160p|4[kK]|uhd`)
 //  7. Write stub via library.WriteStub.
 //  8. Return 200 with {stub_path, fuse_path, hash, size}.
 func (h *LibraryHandler) Add(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
@@ -184,27 +275,21 @@ func (h *LibraryHandler) Add(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var bestFile library.FileStat
-	if req.Type == "movie" {
-		videoFiles := library.FilterVideoFiles(files, is4K)
-		if len(videoFiles) == 0 {
+	timings := validationTimings{}
+	result, reason, transient := h.selectAndProbe(ctx, &req, hash, files, &timings)
+	if reason != "" {
+		if !transient {
 			h.cleanupTorrentIfUnreferenced(hash)
-			writeJSONError(w, http.StatusUnprocessableEntity, "no_valid_files")
-			return
 		}
-		sort.Slice(videoFiles, func(i, j int) bool {
-			return videoFiles[i].Length > videoFiles[j].Length
-		})
-		bestFile = videoFiles[0]
-	} else {
-		var ok bool
-		bestFile, ok = library.SelectEpisodeFile(files, req.Season, req.Episode)
-		if !ok {
-			h.cleanupTorrentIfUnreferenced(hash)
-			writeJSONError(w, http.StatusUnprocessableEntity, "target_episode_not_found")
-			return
+		status := http.StatusUnprocessableEntity
+		if transient {
+			status = http.StatusGatewayTimeout
 		}
+		writeJSONError(w, status, reason)
+		return
 	}
+	bestFile := result.file
+	h.consumeLease(req.ValidationSessionID, hash)
 
 	// Re-derive is4K from the picked file size if magnet title didn't
 	// announce it — anything ≥ Movie4KMinBytes is treated as 4K.
@@ -252,9 +337,266 @@ func (h *LibraryHandler) Add(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Validate handles POST /api/library/validate. It proves metadata, selected
+// file, and requested main English audio without writing a stub.
+func (h *LibraryHandler) Validate(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		writeJSONError(w, http.StatusUnsupportedMediaType, "expected application/json")
+		return
+	}
+
+	started := time.Now()
+	var timings validationTimings
+	var req addRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_json: "+err.Error())
+		return
+	}
+	if err := validateAdd(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(req.RequiredAudioLanguages) == 0 && req.PreferredAudioLanguage == "" {
+		req.RequiredAudioLanguages = []string{"eng"}
+		req.PreferredAudioLanguage = "eng"
+	}
+
+	ctx := r.Context()
+	addStarted := time.Now()
+	hash, err := h.gostorm.AddTorrent(ctx, req.Magnet, req.Title)
+	timings.AddTorrent = time.Since(addStarted).Milliseconds()
+	if err != nil || hash == "" {
+		if err == nil {
+			err = errors.New("empty hash")
+		}
+		reason := "torrent_engine_busy"
+		writeJSON(w, http.StatusOK, validationFailure("transient", reason, hash, req.ValidationSessionID, timings, started))
+		return
+	}
+
+	metaStarted := time.Now()
+	files, err := h.gostorm.GetTorrentFiles(ctx, hash, h.cfg.TimeoutSec)
+	timings.MetadataWait = time.Since(metaStarted).Milliseconds()
+	if err != nil {
+		h.cleanupTorrentIfUnreferenced(hash)
+		reason := "metadata_timeout"
+		writeJSON(w, http.StatusOK, validationFailure("transient", reason, hash, req.ValidationSessionID, timings, started))
+		return
+	}
+
+	result, reason, transient := h.selectAndProbe(ctx, &req, hash, files, &timings)
+	if reason != "" {
+		if !transient {
+			h.cleanupTorrentIfUnreferenced(hash)
+		}
+		status := "invalid"
+		if transient {
+			status = "transient"
+		}
+		writeJSON(w, http.StatusOK, validationFailure(status, reason, hash, req.ValidationSessionID, timings, started))
+		return
+	}
+
+	expires := time.Now().UTC().Add(time.Duration(h.cfg.ValidationLeaseMin) * time.Minute)
+	sessionID := strings.TrimSpace(req.ValidationSessionID)
+	if sessionID != "" {
+		h.storeLease(sessionID, hash, result.file, result.tracks, expires)
+	}
+	timings.Total = time.Since(started).Milliseconds()
+	idx := result.selected.StreamIndex
+	selectedLanguage := library.NormalizeAudioLanguage(result.selected.Language)
+	if selectedLanguage == "" {
+		selectedLanguage = library.NormalizeAudioLanguage(req.PreferredAudioLanguage)
+	}
+	resp := validateResponse{
+		Status:                "valid",
+		Hash:                  hash,
+		SelectedFile:          &selectedFileResponse{ID: result.file.ID, Path: result.file.Path, Size: result.file.Length},
+		AudioTracks:           result.tracks,
+		SelectedAudioIndex:    &idx,
+		SelectedAudioLanguage: selectedLanguage,
+		ValidationSessionID:   sessionID,
+		TimingsMS:             timings,
+	}
+	if sessionID != "" {
+		resp.ValidationLeaseExpiresAt = &expires
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *LibraryHandler) ReleaseValidation(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		writeJSONError(w, http.StatusUnsupportedMediaType, "expected application/json")
+		return
+	}
+	var req releaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_json: "+err.Error())
+		return
+	}
+	if req.ValidationSessionID == "" || req.Hash == "" {
+		writeJSONError(w, http.StatusBadRequest, "validation_session_id and hash required")
+		return
+	}
+	if h.releaseLease(req.ValidationSessionID, req.Hash) && !h.hashHasValidationLease(req.Hash) {
+		h.cleanupTorrentIfUnreferenced(req.Hash)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
+}
+
+type selectionProbeResult struct {
+	file     library.FileStat
+	tracks   []library.AudioTrack
+	selected library.AudioTrack
+}
+
+func validationFailure(status, reason, hash, sessionID string, timings validationTimings, started time.Time) validateResponse {
+	timings.Total = time.Since(started).Milliseconds()
+	return validateResponse{Status: status, Reason: &reason, Hash: hash, ValidationSessionID: sessionID, TimingsMS: timings}
+}
+
+func (h *LibraryHandler) selectAndProbe(ctx context.Context, req *addRequest, hash string, files []library.FileStat, timings *validationTimings) (selectionProbeResult, string, bool) {
+	selectStarted := time.Now()
+	bestFile, reason := selectRequestedFile(req, files, reMagnet4K.MatchString(req.Magnet))
+	timings.FileSelect = time.Since(selectStarted).Milliseconds()
+	if reason != "" {
+		return selectionProbeResult{}, reason, false
+	}
+
+	if len(req.RequiredAudioLanguages) == 0 && req.PreferredAudioLanguage == "" {
+		return selectionProbeResult{file: bestFile}, "", false
+	}
+
+	probeStarted := time.Now()
+	tracks, err := h.gostorm.ProbeAudio(ctx, hash, bestFile.ID, h.cfg.TimeoutSec)
+	timings.AudioProbe = time.Since(probeStarted).Milliseconds()
+	if err != nil {
+		return selectionProbeResult{}, "audio_probe_failed", true
+	}
+	selected, foundLanguage, foundMain := library.SelectPreferredMainAudio(tracks, req.RequiredAudioLanguages, req.PreferredAudioLanguage)
+	if !foundLanguage {
+		return selectionProbeResult{}, "no_english_audio", false
+	}
+	if !foundMain {
+		return selectionProbeResult{}, "no_main_english_audio", false
+	}
+	return selectionProbeResult{file: bestFile, tracks: tracks, selected: selected}, "", false
+}
+
+func selectRequestedFile(req *addRequest, files []library.FileStat, is4K bool) (library.FileStat, string) {
+	if req.SelectedFileID != nil || req.SelectedFilePath != "" {
+		for _, f := range files {
+			if req.SelectedFileID != nil && f.ID != *req.SelectedFileID {
+				continue
+			}
+			if req.SelectedFilePath != "" && f.Path != req.SelectedFilePath {
+				continue
+			}
+			if !library.IsVideoFile(f.Path) {
+				return library.FileStat{}, "no_valid_files"
+			}
+			if req.Type == "movie" {
+				minSize, maxSize := library.Movie1080pMinBytes, library.Movie1080pMaxBytes
+				if is4K {
+					minSize, maxSize = library.Movie4KMinBytes, library.Movie4KMaxBytes
+				}
+				if f.Length < minSize || f.Length > maxSize {
+					return library.FileStat{}, "no_valid_files"
+				}
+			} else {
+				if f.Length < library.EpisodeMinBytes || f.Length > library.EpisodeMaxBytes {
+					return library.FileStat{}, "no_valid_files"
+				}
+				season, episode, ok := library.ParseEpisodeFromFilename(f.Path)
+				if !ok || season != req.Season || episode != req.Episode {
+					return library.FileStat{}, "target_episode_not_found"
+				}
+			}
+			return f, ""
+		}
+		return library.FileStat{}, "selected_file_missing"
+	}
+	if req.Type == "movie" {
+		videoFiles := library.FilterVideoFiles(files, is4K)
+		if len(videoFiles) == 0 {
+			return library.FileStat{}, "no_valid_files"
+		}
+		sort.Slice(videoFiles, func(i, j int) bool { return videoFiles[i].Length > videoFiles[j].Length })
+		return videoFiles[0], ""
+	}
+	bestFile, ok := library.SelectEpisodeFile(files, req.Season, req.Episode)
+	if !ok {
+		return library.FileStat{}, "target_episode_not_found"
+	}
+	return bestFile, ""
+}
+
+func (h *LibraryHandler) storeLease(sessionID, hash string, file library.FileStat, tracks []library.AudioTrack, expires time.Time) {
+	h.leasesMu.Lock()
+	defer h.leasesMu.Unlock()
+	h.expireLeasesLocked(time.Now())
+	h.leases[sessionID] = &validationLease{SessionID: sessionID, Hash: hash, File: file, Tracks: tracks, ExpiresAt: expires}
+}
+
+func (h *LibraryHandler) consumeLease(sessionID, hash string) bool {
+	if sessionID == "" || hash == "" {
+		return false
+	}
+	h.leasesMu.Lock()
+	defer h.leasesMu.Unlock()
+	h.expireLeasesLocked(time.Now())
+	lease, ok := h.leases[sessionID]
+	if !ok || !strings.EqualFold(lease.Hash, hash) {
+		return false
+	}
+	delete(h.leases, sessionID)
+	return true
+}
+
+func (h *LibraryHandler) releaseLease(sessionID, hash string) bool {
+	return h.consumeLease(sessionID, hash)
+}
+
+func (h *LibraryHandler) hashHasValidationLease(hash string) bool {
+	h.leasesMu.Lock()
+	defer h.leasesMu.Unlock()
+	h.expireLeasesLocked(time.Now())
+	for _, lease := range h.leases {
+		if strings.EqualFold(lease.Hash, hash) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *LibraryHandler) expireLeasesLocked(now time.Time) {
+	for key, lease := range h.leases {
+		if now.After(lease.ExpiresAt) {
+			delete(h.leases, key)
+		}
+	}
+}
+
 // Remove handles POST /api/library/remove. Idempotent: missing torrent
 // or missing stub is not an error.
 func (h *LibraryHandler) Remove(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
@@ -320,7 +662,7 @@ func (h *LibraryHandler) pathUnderPhysicalRoot(path string) bool {
 }
 
 func (h *LibraryHandler) cleanupTorrentIfUnreferenced(hash string) {
-	if hash == "" || h.stubTreeReferencesHash(hash) {
+	if hash == "" || h.stubTreeReferencesHash(hash) || h.hashHasValidationLease(hash) {
 		return
 	}
 	_ = h.gostorm.RemoveTorrent(context.Background(), hash)

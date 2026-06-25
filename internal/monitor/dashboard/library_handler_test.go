@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gostream/internal/library"
 )
 
 type fakeGoStorm struct {
 	files       []library.FileStat
+	audioTracks []library.AudioTrack
 	removedHash string
 	addedMagnet string
 	addedTitle  string
@@ -40,6 +42,10 @@ func (f *fakeGoStorm) RemoveTorrent(ctx context.Context, hash string) error {
 	return nil
 }
 
+func (f *fakeGoStorm) ProbeAudio(ctx context.Context, hash string, fileID int, maxWaitSec int) ([]library.AudioTrack, error) {
+	return f.audioTracks, nil
+}
+
 func (f *fakeGoStorm) BaseURL() string { return "http://gostorm.local" }
 
 func postRemove(t *testing.T, h *LibraryHandler, body map[string]any) *httptest.ResponseRecorder {
@@ -49,6 +55,7 @@ func postRemove(t *testing.T, h *LibraryHandler, body map[string]any) *httptest.
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/library/remove", bytes.NewReader(raw))
+	req.RemoteAddr = "127.0.0.1:1234"
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	h.Remove(rr, req)
@@ -62,10 +69,165 @@ func postAdd(t *testing.T, h *LibraryHandler, body map[string]any) *httptest.Res
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/library/add", bytes.NewReader(raw))
+	req.RemoteAddr = "127.0.0.1:1234"
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	h.Add(rr, req)
 	return rr
+}
+
+func postValidate(t *testing.T, h *LibraryHandler, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/library/validate", bytes.NewReader(raw))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.Validate(rr, req)
+	return rr
+}
+
+func baseEpisodeRequest(magnet string) map[string]any {
+	return map[string]any{
+		"type":                     "episode",
+		"title":                    "Avatar The Last Airbender",
+		"season":                   2,
+		"episode":                  1,
+		"series_imdb":              "tt0417299",
+		"magnet":                   magnet,
+		"preferred_audio_language": "eng",
+		"required_audio_languages": []string{"eng", "en", "english"},
+		"validation_session_id":    "session-1",
+	}
+}
+
+func TestLibraryValidate_PolishDefaultEnglishPresentSelectsEnglish(t *testing.T) {
+	gb := int64(1024 * 1024 * 1024)
+	real := t.TempDir()
+	fuse := t.TempDir()
+	magnet := "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01"
+	gs := &fakeGoStorm{
+		files: []library.FileStat{{ID: 12, Path: "Avatar.S02E01.mkv", Length: 5 * gb}},
+		audioTracks: []library.AudioTrack{
+			{StreamIndex: 1, Language: "pol", Title: "Polish", Codec: "aac", Channels: 2, Default: true},
+			{StreamIndex: 2, Language: "eng", Title: "English", Codec: "aac", Channels: 2},
+		},
+	}
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: real, FuseMountPath: fuse, TimeoutSec: 1}, gs)
+
+	rr := postValidate(t, h, baseEpisodeRequest(magnet))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp validateResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != "valid" || resp.SelectedAudioIndex == nil || *resp.SelectedAudioIndex != 2 {
+		t.Fatalf("unexpected validate response: %+v", resp)
+	}
+	if _, err := os.Stat(filepath.Join(real, "tv")); !os.IsNotExist(err) {
+		t.Fatalf("validate must not write stub tree; stat err=%v", err)
+	}
+}
+
+func TestLibraryValidate_NoEnglishAudioInvalid(t *testing.T) {
+	gb := int64(1024 * 1024 * 1024)
+	gs := &fakeGoStorm{
+		files:       []library.FileStat{{ID: 12, Path: "Avatar.S02E01.mkv", Length: 5 * gb}},
+		audioTracks: []library.AudioTrack{{StreamIndex: 1, Language: "pol", Title: "Polish", Codec: "aac", Channels: 2}},
+	}
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir(), TimeoutSec: 1}, gs)
+
+	rr := postValidate(t, h, baseEpisodeRequest("magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01"))
+
+	var resp validateResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != "invalid" || resp.Reason == nil || *resp.Reason != "no_english_audio" {
+		t.Fatalf("unexpected validate response: %+v", resp)
+	}
+}
+
+func TestLibraryAdd_RevalidatesSelectedFileAudioHints(t *testing.T) {
+	gb := int64(1024 * 1024 * 1024)
+	magnet := "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01"
+	gs := &fakeGoStorm{
+		files:       []library.FileStat{{ID: 12, Path: "Avatar.S02E01.mkv", Length: 5 * gb}},
+		audioTracks: []library.AudioTrack{{StreamIndex: 2, Language: "eng", Title: "English", Codec: "aac", Channels: 2}},
+	}
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir(), TimeoutSec: 1}, gs)
+	body := baseEpisodeRequest(magnet)
+	body["selected_file_id"] = 12
+	body["selected_file_path"] = "Avatar.S02E01.mkv"
+
+	rr := postAdd(t, h, body)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestLibraryAuthTokenAndLoopbackRules(t *testing.T) {
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir(), TimeoutSec: 1, AuthToken: "secret"}, &fakeGoStorm{})
+	raw := []byte(`{"stub_path":"/tmp/nope"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/library/remove", bytes.NewReader(raw))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.Remove(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("missing token status=%d", rr.Code)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/library/remove", bytes.NewReader(raw))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Gostream-Token", "secret")
+	rr = httptest.NewRecorder()
+	h.Remove(rr, req)
+	if rr.Code == http.StatusUnauthorized || rr.Code == http.StatusForbidden {
+		t.Fatalf("correct token rejected: %d %s", rr.Code, rr.Body.String())
+	}
+
+	loopbackOnly := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir(), TimeoutSec: 1}, &fakeGoStorm{})
+	req = httptest.NewRequest(http.MethodPost, "/api/library/validate/release", bytes.NewReader([]byte(`{"validation_session_id":"s","hash":"h"}`)))
+	req.RemoteAddr = "203.0.113.9:4321"
+	req.Header.Set("Content-Type", "application/json")
+	rr = httptest.NewRecorder()
+	loopbackOnly.ReleaseValidation(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback anonymous status=%d", rr.Code)
+	}
+}
+
+func TestLibraryReleaseValidationPreservesSharedHashLease(t *testing.T) {
+	gs := &fakeGoStorm{}
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir(), TimeoutSec: 1}, gs)
+	expires := time.Now().Add(10 * time.Minute)
+	h.storeLease("session-1", "abcdef0123456789abcdef0123456789abcdef01", library.FileStat{ID: 1}, nil, expires)
+	h.storeLease("session-2", "abcdef0123456789abcdef0123456789abcdef01", library.FileStat{ID: 1}, nil, expires)
+
+	raw := []byte(`{"validation_session_id":"session-1","hash":"abcdef0123456789abcdef0123456789abcdef01"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/library/validate/release", bytes.NewReader(raw))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ReleaseValidation(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if gs.removedHash != "" {
+		t.Fatalf("shared hash was removed while second validation lease exists: %q", gs.removedHash)
+	}
+	if !h.hashHasValidationLease("abcdef0123456789abcdef0123456789abcdef01") {
+		t.Fatalf("second validation lease missing")
+	}
 }
 
 func TestLibraryAddEpisode_SelectsRequestedEpisodeFromPack(t *testing.T) {

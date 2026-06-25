@@ -85,10 +85,12 @@ func FilterEpisodeFiles(files []FileStat) []FileStat {
 }
 
 var (
-	reTVEpNum       = regexp.MustCompile(`(?i)[Ss](\d+)[Ee](\d+)`)
-	reTV1xEp        = regexp.MustCompile(`(?i)(\d+)x(\d+)`)
-	reTVSeasonDir   = regexp.MustCompile(`(?i)(?:^|[ ._-])(?:season[ ._-]*|s)(\d{1,3})(?:$|[ ._-])`)
-	reTVEpisodeOnly = regexp.MustCompile(`(?i)(?:^|[\s._-])(?:e(?:p(?:isode)?)?[\s._-]*)?(\d{1,3})(?:[\s._-]|$)`)
+	reTVEpNum          = regexp.MustCompile(`(?i)[Ss](\d+)[Ee](\d+)`)
+	reTV1xEp           = regexp.MustCompile(`(?i)(\d+)x(\d+)`)
+	reTVCombinedEp     = regexp.MustCompile(`(?i)(?:^|[\s._-])([1-9])(\d{2})(?:[\s._-]|$)`)
+	reTVSeasonDir      = regexp.MustCompile(`(?i)(?:^|[ ._-])(?:(?:season|book)[ ._-]*|s)(\d{1,3})(?:$|[ ._-])`)
+	reTVEpisodeOnly    = regexp.MustCompile(`(?i)(?:^|[\s._-])(?:(?:e(?:p(?:isode)?)?|chapter)[\s._-]*)?(\d{1,3})(?:[\s._-]|$)`)
+	reTVChapterEpisode = regexp.MustCompile(`(?i)(?:^|[\s._-])chapter[\s._-]*(\d{1,3})(?:[\s._-]|$)`)
 )
 
 // ParseEpisodeFromFilename extracts season/episode tokens from torrent
@@ -106,17 +108,40 @@ func ParseEpisodeFromFilename(path string) (season int, episode int, ok bool) {
 		_, _ = fmt.Sscanf(m[2], "%d", &episode)
 		return season, episode, season > 0 && episode > 0
 	}
+	if m := reTVCombinedEp.FindStringSubmatch(name); len(m) == 3 {
+		_, _ = fmt.Sscanf(m[1], "%d", &season)
+		_, _ = fmt.Sscanf(m[2], "%d", &episode)
+		if season > 0 && episode > 0 && episode <= 99 {
+			return season, episode, true
+		}
+	}
 
 	season = seasonFromPath(path)
 	if season <= 0 {
 		return 0, 0, false
 	}
 
-	for _, m := range reTVEpisodeOnly.FindAllStringSubmatch(name, -1) {
-		var ep int
-		_, _ = fmt.Sscanf(m[1], "%d", &ep)
-		if ep > 0 && ep <= 200 && ep != 480 && ep != 720 {
-			return season, ep, true
+	if isBookSeasonPath(path) {
+		for _, m := range reTVChapterEpisode.FindAllStringSubmatch(name, -1) {
+			var ep int
+			_, _ = fmt.Sscanf(m[1], "%d", &ep)
+			if ep > 0 && ep <= 200 {
+				return season, ep, true
+			}
+		}
+		return 0, 0, false
+	}
+
+	for _, re := range []*regexp.Regexp{reTVChapterEpisode, reTVEpisodeOnly} {
+		for _, m := range re.FindAllStringSubmatch(name, -1) {
+			var ep int
+			_, _ = fmt.Sscanf(m[1], "%d", &ep)
+			if ep >= 100 && ep/100 == season && ep%100 > 0 {
+				return season, ep % 100, true
+			}
+			if ep > 0 && ep <= 200 && ep != 480 && ep != 720 && ep != 1080 {
+				return season, ep, true
+			}
 		}
 	}
 
@@ -134,6 +159,17 @@ func seasonFromPath(path string) int {
 		}
 	}
 	return 0
+}
+
+func isBookSeasonPath(path string) bool {
+	path = filepath.ToSlash(path)
+	parts := strings.Split(path, "/")
+	for i := len(parts) - 2; i >= 0; i-- {
+		if strings.Contains(strings.ToLower(parts[i]), "book") {
+			return true
+		}
+	}
+	return false
 }
 
 // SelectEpisodeFile returns the largest valid video file whose basename

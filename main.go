@@ -20,18 +20,18 @@ import (
 	"gostream/internal/gostorm/web"
 	"gostream/internal/lockmgr"
 	"gostream/internal/metadb"
-	"gostream/internal/natpmp"
 	"gostream/internal/monitor/collector"
 	"gostream/internal/monitor/dashboard"
+	"gostream/internal/natpmp"
 	"gostream/internal/opentracker"
 	"gostream/internal/preload"
 	"gostream/internal/prowlarr"
 	"gostream/internal/ratelimit"
 	"gostream/internal/registry"
-	"gostream/internal/telemetry"
 	syncercache "gostream/internal/syncer/cache"
 	"gostream/internal/syncer/engines"
 	"gostream/internal/syncer/scheduler"
+	"gostream/internal/telemetry"
 	"gostream/internal/updater"
 	"gostream/internal/vfs"
 	"gostream/internal/warmup"
@@ -3392,10 +3392,14 @@ func main() {
 		PhysicalSourcePath: physicalSourcePath,
 		FuseMountPath:      virtualMountPath,
 		TimeoutSec:         globalConfig.LibraryAddTimeoutSec,
+		AuthToken:          globalConfig.LibraryAPIToken,
+		ValidationLeaseMin: globalConfig.LibraryLeaseMinutes,
 	}
 	libHandler := dashboard.NewLibraryHandler(libCfg, engines.NewGoStormClient(globalConfig.GoStormBaseURL))
 	http.HandleFunc("/api/library/add", libHandler.Add)
 	http.HandleFunc("/api/library/remove", libHandler.Remove)
+	http.HandleFunc("/api/library/validate", libHandler.Validate)
+	http.HandleFunc("/api/library/validate/release", libHandler.ReleaseValidation)
 
 	// Vault Mode (M6.5)
 	vaultHandler := dashboard.NewVaultHandler(warmup.DiskWarmup, &globalConfig)

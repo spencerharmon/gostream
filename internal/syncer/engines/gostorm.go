@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -151,6 +152,48 @@ func (c *GoStormClient) GetTorrentInfo(ctx context.Context, hash string, maxWait
 func (c *GoStormClient) RemoveTorrent(ctx context.Context, hash string) error {
 	body := map[string]string{"action": "rem", "hash": hash}
 	return c.postTorrents(ctx, body)
+}
+
+// ProbeAudio uses ffprobe against the gostream file stream and returns all
+// audio streams with stable container stream indexes.
+func (c *GoStormClient) ProbeAudio(ctx context.Context, hash string, fileID int, maxWaitSec int) ([]library.AudioTrack, error) {
+	if maxWaitSec <= 0 {
+		maxWaitSec = 45
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, time.Duration(maxWaitSec)*time.Second)
+	defer cancel()
+	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", c.baseURL, url.QueryEscape(hash), fileID)
+	cmd := exec.CommandContext(probeCtx, "ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,codec_name,channels:stream_tags=language,title:stream_disposition=default", "-of", "json", streamURL)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var raw struct {
+		Streams []struct {
+			Index       int               `json:"index"`
+			CodecName   string            `json:"codec_name"`
+			Channels    int               `json:"channels"`
+			Tags        map[string]string `json:"tags"`
+			Disposition struct {
+				Default int `json:"default"`
+			} `json:"disposition"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, err
+	}
+	tracks := make([]library.AudioTrack, 0, len(raw.Streams))
+	for _, stream := range raw.Streams {
+		tracks = append(tracks, library.AudioTrack{
+			StreamIndex: stream.Index,
+			Language:    library.NormalizeAudioLanguage(stream.Tags["language"]),
+			Title:       stream.Tags["title"],
+			Codec:       stream.CodecName,
+			Channels:    stream.Channels,
+			Default:     stream.Disposition.Default == 1,
+		})
+	}
+	return tracks, nil
 }
 
 // ListTorrents returns all active torrents.

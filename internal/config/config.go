@@ -202,7 +202,9 @@ type Config struct {
 	// --- External library/add API ---
 	// Server-side timeout (seconds) used by POST /api/library/add when
 	// waiting for torrent metadata. Caller receives 504 on exceed.
-	LibraryAddTimeoutSec int `json:"library_add_timeout_sec"`
+	LibraryAddTimeoutSec int    `json:"library_add_timeout_sec"`
+	LibraryAPIToken      string `json:"library_api_token"`
+	LibraryLeaseMinutes  int    `json:"library_validation_lease_minutes"`
 }
 
 // Save persists the current configuration to config.json
@@ -266,6 +268,7 @@ func LoadConfig() Config {
 		EnableStateDB: true,
 
 		LibraryAddTimeoutSec: 45,
+		LibraryLeaseMinutes:  10,
 
 		// Legacy Fixed Defaults
 		DefaultFileSize:         30 * 1024 * 1024 * 1024,
@@ -386,6 +389,9 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("MKV_PROXY_GOSTORM_URL"); v != "" {
 		c.GoStormBaseURL = v
+	}
+	if v := firstEnv("GOSTREAM_LIBRARY_TOKEN", "MKV_PROXY_LIBRARY_TOKEN"); v != "" {
+		c.LibraryAPIToken = v
 	}
 	if v := os.Getenv("MKV_PROXY_AI_URL"); v != "" {
 		c.AIURL = v
