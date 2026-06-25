@@ -76,13 +76,13 @@ func TestFilterVideoFiles_FiltersByExtAndSize(t *testing.T) {
 
 func TestFilterEpisodeFiles(t *testing.T) {
 	in := []FileStat{
-		{Path: "sample.mkv", Length: 100},
+		{Path: "sample.mkv", Length: 1},
 		{Path: "ep.mkv", Length: 2 * 1024 * 1024 * 1024},
 		{Path: "readme.txt", Length: 5 * 1024 * 1024 * 1024},
 		{Path: "huge.mkv", Length: 50 * 1024 * 1024 * 1024},
 	}
 	got := FilterEpisodeFiles(in)
-	if len(got) != 1 || got[0].Path != "ep.mkv" {
+	if len(got) != 2 || got[0].Path != "sample.mkv" || got[1].Path != "ep.mkv" {
 		t.Errorf("episode filter: got %+v", got)
 	}
 }
@@ -117,9 +117,9 @@ func TestSelectEpisodeFile_TargetMatchOnlyLargestMatch(t *testing.T) {
 	gb := int64(1024 * 1024 * 1024)
 	files := []FileStat{
 		{ID: 1, Path: "Show.S01E01.mkv", Length: 20 * gb},
-		{ID: 2, Path: "Show.S01E02.720p.mkv", Length: 2 * gb},
-		{ID: 3, Path: "Show.S01E02.1080p.mkv", Length: 5 * gb},
-		{ID: 5, Path: "Season 01/02 - Target From Pack.mkv", Length: 4 * gb},
+		{ID: 2, Path: "Show.S01E02.720p.mkv", Length: 200 * 1024 * 1024},
+		{ID: 3, Path: "Show.S01E02.1080p.mkv", Length: 500 * 1024 * 1024},
+		{ID: 5, Path: "Season 01/02 - Target From Pack.mkv", Length: 400 * 1024 * 1024},
 		{ID: 4, Path: "Show.S01E03.mkv", Length: 25 * gb},
 	}
 	got, ok := SelectEpisodeFile(files, 1, 2)

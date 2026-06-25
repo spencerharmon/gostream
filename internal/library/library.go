@@ -34,7 +34,7 @@ const (
 	Movie4KMaxBytes    int64 = 60 * 1024 * 1024 * 1024 // 60 GB
 	Movie1080pMinBytes int64 = 4 * 1024 * 1024 * 1024  // 4 GB
 	Movie1080pMaxBytes int64 = 20 * 1024 * 1024 * 1024 // 20 GB
-	EpisodeMinBytes    int64 = 1 * 1024 * 1024 * 1024  // 1 GB
+	EpisodeMinBytes    int64 = 1                         // effectively no minimum
 	EpisodeMaxBytes    int64 = 30 * 1024 * 1024 * 1024 // 30 GB
 )
 
