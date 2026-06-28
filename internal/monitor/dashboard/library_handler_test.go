@@ -117,6 +117,52 @@ func baseEpisodeRequest(magnet string) map[string]any {
 	}
 }
 
+func TestLibraryValidate_AllowedContainersDefaultMkvRejectsMovMovie(t *testing.T) {
+	gb := int64(1024 * 1024 * 1024)
+	magnet := "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01"
+	gs := &fakeGoStorm{files: []library.FileStat{{ID: 1, Path: "Movie.mov", Length: 8 * gb}}}
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir(), TimeoutSec: 1}, gs)
+
+	rr := postValidate(t, h, map[string]any{
+		"type": "movie", "title": "Movie", "year": 2024, "tmdb": 1, "magnet": magnet,
+		"allowed_video_containers": []string{"mkv"},
+	})
+
+	var resp validateResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != "invalid" || resp.Reason == nil || *resp.Reason != "container_not_allowed" {
+		t.Fatalf("unexpected validate response: %+v body=%s", resp, rr.Body.String())
+	}
+}
+
+func TestLibraryValidate_AllowedContainersSelectsMkvEpisodeOverLargerMov(t *testing.T) {
+	gb := int64(1024 * 1024 * 1024)
+	magnet := "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01"
+	gs := &fakeGoStorm{
+		files: []library.FileStat{
+			{ID: 10, Path: "Show.S02E01.mov", Length: 9 * gb},
+			{ID: 12, Path: "Show.S02E01.mkv", Length: 5 * gb},
+		},
+		audioTracks: []library.AudioTrack{{StreamIndex: 2, Language: "eng", Title: "English", Codec: "aac", Channels: 2}},
+	}
+	h := NewLibraryHandler(LibraryConfig{PhysicalSourcePath: t.TempDir(), FuseMountPath: t.TempDir(), TimeoutSec: 1}, gs)
+	body := baseEpisodeRequest(magnet)
+	body["title"] = "Show"
+	body["allowed_video_containers"] = []string{"mkv"}
+
+	rr := postValidate(t, h, body)
+
+	var resp validateResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != "valid" || resp.SelectedFile == nil || resp.SelectedFile.ID != 12 || resp.SelectedFile.Container != "mkv" {
+		t.Fatalf("unexpected validate response: %+v body=%s", resp, rr.Body.String())
+	}
+}
+
 func TestLibraryValidate_PolishDefaultEnglishPresentSelectsEnglish(t *testing.T) {
 	gb := int64(1024 * 1024 * 1024)
 	real := t.TempDir()

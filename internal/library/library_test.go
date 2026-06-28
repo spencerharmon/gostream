@@ -87,6 +87,36 @@ func TestFilterEpisodeFiles(t *testing.T) {
 	}
 }
 
+func TestVideoContainerAllowList(t *testing.T) {
+	if got := NormalizeAllowedVideoContainers([]string{".MKV", "mp4", "mkv", "txt", ""}); len(got) != 2 || got[0] != "mkv" || got[1] != "mp4" {
+		t.Fatalf("normalized containers = %#v", got)
+	}
+	if !IsAllowedVideoFile("Movie.MKV", []string{"mkv"}) {
+		t.Fatal("expected mkv allowed")
+	}
+	if IsAllowedVideoFile("Movie.mov", []string{"mkv"}) {
+		t.Fatal("expected mov blocked by mkv allow-list")
+	}
+}
+
+func TestFilterFilesByContainers_MovieAndEpisodeParity(t *testing.T) {
+	gb := int64(1024 * 1024 * 1024)
+	files := []FileStat{
+		{ID: 1, Path: "Movie.mov", Length: 8 * gb},
+		{ID: 2, Path: "Movie.mkv", Length: 7 * gb},
+		{ID: 3, Path: "Show.S01E01.mov", Length: 2 * gb},
+		{ID: 4, Path: "Show.S01E01.mkv", Length: 3 * gb},
+	}
+	movies := FilterVideoFilesByContainers(files, false, []string{"mkv"})
+	if len(movies) != 1 || movies[0].ID != 2 {
+		t.Fatalf("movie container filter = %+v", movies)
+	}
+	episode, ok := SelectEpisodeFileByContainers(files, 1, 1, []string{"mkv"})
+	if !ok || episode.ID != 4 {
+		t.Fatalf("episode container filter = %+v ok=%v", episode, ok)
+	}
+}
+
 func TestParseEpisodeFromFilename(t *testing.T) {
 	cases := []struct {
 		name    string

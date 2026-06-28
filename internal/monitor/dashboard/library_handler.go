@@ -87,16 +87,17 @@ func NewLibraryHandler(cfg LibraryConfig, gs GoStormClient) *LibraryHandler {
 }
 
 type addRequest struct {
-	Type       string `json:"type"`
-	IMDB       string `json:"imdb"`
-	TMDB       int    `json:"tmdb"`
-	Title      string `json:"title"`
-	Year       int    `json:"year"`
-	Season     int    `json:"season"`
-	Episode    int    `json:"episode"`
-	SeriesIMDB string `json:"series_imdb"`
-	Magnet     string `json:"magnet"`
-	MinQuality string `json:"min_quality"` // TODO(follow-up): honor quality floor
+	Type                   string   `json:"type"`
+	IMDB                   string   `json:"imdb"`
+	TMDB                   int      `json:"tmdb"`
+	Title                  string   `json:"title"`
+	Year                   int      `json:"year"`
+	Season                 int      `json:"season"`
+	Episode                int      `json:"episode"`
+	SeriesIMDB             string   `json:"series_imdb"`
+	Magnet                 string   `json:"magnet"`
+	MinQuality             string   `json:"min_quality"` // TODO(follow-up): honor quality floor
+	AllowedVideoContainers []string `json:"allowed_video_containers"`
 
 	RequiredAudioLanguages []string `json:"required_audio_languages"`
 	PreferredAudioLanguage string   `json:"preferred_audio_language"`
@@ -113,9 +114,10 @@ type addResponse struct {
 }
 
 type selectedFileResponse struct {
-	ID   int    `json:"id"`
-	Path string `json:"path"`
-	Size int64  `json:"size"`
+	ID        int    `json:"id"`
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	Container string `json:"container"`
 }
 
 type validationTimings struct {
@@ -426,7 +428,7 @@ func (h *LibraryHandler) Validate(w http.ResponseWriter, r *http.Request) {
 	resp := validateResponse{
 		Status:                "valid",
 		Hash:                  hash,
-		SelectedFile:          &selectedFileResponse{ID: result.file.ID, Path: result.file.Path, Size: result.file.Length},
+		SelectedFile:          selectedFileToResponse(result.file),
 		AudioTracks:           result.tracks,
 		SelectedAudioIndex:    &idx,
 		SelectedAudioLanguage: selectedLanguage,
@@ -473,6 +475,10 @@ type selectionProbeResult struct {
 	selected library.AudioTrack
 }
 
+func selectedFileToResponse(file library.FileStat) *selectedFileResponse {
+	return &selectedFileResponse{ID: file.ID, Path: file.Path, Size: file.Length, Container: library.VideoContainer(file.Path)}
+}
+
 func validationFailure(status, reason, hash, sessionID string, timings validationTimings, started time.Time) validateResponse {
 	timings.Total = time.Since(started).Milliseconds()
 	return validateResponse{Status: status, Reason: &reason, Hash: hash, ValidationSessionID: sessionID, TimingsMS: timings}
@@ -507,6 +513,7 @@ func (h *LibraryHandler) selectAndProbe(ctx context.Context, req *addRequest, ha
 }
 
 func selectRequestedFile(req *addRequest, files []library.FileStat, is4K bool) (library.FileStat, string) {
+	allowedContainers := library.NormalizeAllowedVideoContainers(req.AllowedVideoContainers)
 	if req.SelectedFileID != nil || req.SelectedFilePath != "" {
 		for _, f := range files {
 			if req.SelectedFileID != nil && f.ID != *req.SelectedFileID {
@@ -517,6 +524,9 @@ func selectRequestedFile(req *addRequest, files []library.FileStat, is4K bool) (
 			}
 			if !library.IsVideoFile(f.Path) {
 				return library.FileStat{}, "no_valid_files"
+			}
+			if !library.IsAllowedVideoFile(f.Path, allowedContainers) {
+				return library.FileStat{}, "container_not_allowed"
 			}
 			if req.Type == "movie" {
 				minSize, maxSize := library.Movie1080pMinBytes, library.Movie1080pMaxBytes
@@ -540,15 +550,36 @@ func selectRequestedFile(req *addRequest, files []library.FileStat, is4K bool) (
 		return library.FileStat{}, "selected_file_missing"
 	}
 	if req.Type == "movie" {
-		videoFiles := library.FilterVideoFiles(files, is4K)
+		videoFiles := library.FilterVideoFilesByContainers(files, is4K, allowedContainers)
 		if len(videoFiles) == 0 {
+			minSize, maxSize := library.Movie1080pMinBytes, library.Movie1080pMaxBytes
+			if is4K {
+				minSize, maxSize = library.Movie4KMinBytes, library.Movie4KMaxBytes
+			}
+			for _, f := range files {
+				if library.IsVideoFile(f.Path) && f.Length >= minSize && f.Length <= maxSize && !library.IsAllowedVideoFile(f.Path, allowedContainers) {
+					return library.FileStat{}, "container_not_allowed"
+				}
+			}
 			return library.FileStat{}, "no_valid_files"
 		}
 		sort.Slice(videoFiles, func(i, j int) bool { return videoFiles[i].Length > videoFiles[j].Length })
 		return videoFiles[0], ""
 	}
-	bestFile, ok := library.SelectEpisodeFile(files, req.Season, req.Episode)
+	bestFile, ok := library.SelectEpisodeFileByContainers(files, req.Season, req.Episode, allowedContainers)
 	if !ok {
+		for _, f := range files {
+			season, episode, parsed := library.ParseEpisodeFromFilename(f.Path)
+			if !parsed || season != req.Season || episode != req.Episode {
+				continue
+			}
+			if !library.IsVideoFile(f.Path) || f.Length < library.EpisodeMinBytes || f.Length > library.EpisodeMaxBytes {
+				continue
+			}
+			if !library.IsAllowedVideoFile(f.Path, allowedContainers) {
+				return library.FileStat{}, "container_not_allowed"
+			}
+		}
 		return library.FileStat{}, "target_episode_not_found"
 	}
 	return bestFile, ""
@@ -848,6 +879,15 @@ func validateAdd(req *addRequest) error {
 	}
 	if library.HashFromMagnet(req.Magnet) == "" {
 		return errors.New("magnet missing valid btih hash")
+	}
+	for _, raw := range req.AllowedVideoContainers {
+		token := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(raw), "."))
+		if token == "" {
+			continue
+		}
+		if !library.IsVideoFile("x." + token) {
+			return fmt.Errorf("unsupported video container %q", raw)
+		}
 	}
 	return nil
 }

@@ -34,7 +34,7 @@ const (
 	Movie4KMaxBytes    int64 = 60 * 1024 * 1024 * 1024 // 60 GB
 	Movie1080pMinBytes int64 = 4 * 1024 * 1024 * 1024  // 4 GB
 	Movie1080pMaxBytes int64 = 20 * 1024 * 1024 * 1024 // 20 GB
-	EpisodeMinBytes    int64 = 1                         // effectively no minimum
+	EpisodeMinBytes    int64 = 1                       // effectively no minimum
 	EpisodeMaxBytes    int64 = 30 * 1024 * 1024 * 1024 // 30 GB
 )
 
@@ -48,9 +48,66 @@ func IsVideoFile(p string) bool {
 	return ok
 }
 
+// VideoContainer returns the lower-case extension without the leading dot
+// for recognized video files, or an empty string for non-video paths.
+func VideoContainer(p string) string {
+	ext := strings.ToLower(filepath.Ext(p))
+	if _, ok := videoExts[ext]; !ok {
+		return ""
+	}
+	return strings.TrimPrefix(ext, ".")
+}
+
+// NormalizeAllowedVideoContainers normalizes operator/API allow-lists. Empty
+// means every recognized video container is allowed.
+func NormalizeAllowedVideoContainers(values []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		token := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(raw), "."))
+		if token == "" {
+			continue
+		}
+		if _, ok := videoExts["."+token]; !ok {
+			continue
+		}
+		if _, ok := seen[token]; ok {
+			continue
+		}
+		seen[token] = struct{}{}
+		out = append(out, token)
+	}
+	return out
+}
+
+// IsAllowedVideoFile reports whether p is recognized video and, when an
+// allow-list is supplied, whether its container is in that allow-list.
+func IsAllowedVideoFile(p string, allowedContainers []string) bool {
+	container := VideoContainer(p)
+	if container == "" {
+		return false
+	}
+	allowed := NormalizeAllowedVideoContainers(allowedContainers)
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, token := range allowed {
+		if token == container {
+			return true
+		}
+	}
+	return false
+}
+
 // FilterVideoFiles keeps only video files whose size falls in the movie
 // 4K (is4K=true) or 1080p (is4K=false) band. Order is preserved.
 func FilterVideoFiles(files []FileStat, is4K bool) []FileStat {
+	return FilterVideoFilesByContainers(files, is4K, nil)
+}
+
+// FilterVideoFilesByContainers applies the movie size band plus an optional
+// video-container allow-list. Empty allowedContainers allows all video files.
+func FilterVideoFilesByContainers(files []FileStat, is4K bool, allowedContainers []string) []FileStat {
 	minSize := Movie1080pMinBytes
 	maxSize := Movie1080pMaxBytes
 	if is4K {
@@ -59,7 +116,7 @@ func FilterVideoFiles(files []FileStat, is4K bool) []FileStat {
 	}
 	var out []FileStat
 	for _, f := range files {
-		if !IsVideoFile(f.Path) {
+		if !IsAllowedVideoFile(f.Path, allowedContainers) {
 			continue
 		}
 		if f.Length >= minSize && f.Length <= maxSize {
@@ -72,9 +129,15 @@ func FilterVideoFiles(files []FileStat, is4K bool) []FileStat {
 // FilterEpisodeFiles keeps only video files inside the episode size
 // band (1–30 GB) — matches the TV engine's per-episode acceptance.
 func FilterEpisodeFiles(files []FileStat) []FileStat {
+	return FilterEpisodeFilesByContainers(files, nil)
+}
+
+// FilterEpisodeFilesByContainers applies the episode size band plus an optional
+// video-container allow-list. Empty allowedContainers allows all video files.
+func FilterEpisodeFilesByContainers(files []FileStat, allowedContainers []string) []FileStat {
 	var out []FileStat
 	for _, f := range files {
-		if !IsVideoFile(f.Path) {
+		if !IsAllowedVideoFile(f.Path, allowedContainers) {
 			continue
 		}
 		if f.Length >= EpisodeMinBytes && f.Length <= EpisodeMaxBytes {
@@ -177,9 +240,15 @@ func isBookSeasonPath(path string) bool {
 // back to the largest unrelated video file; season/series packs must not
 // create a valid-looking stub pointing at the wrong episode.
 func SelectEpisodeFile(files []FileStat, season, episode int) (FileStat, bool) {
+	return SelectEpisodeFileByContainers(files, season, episode, nil)
+}
+
+// SelectEpisodeFileByContainers returns the largest matching episode file after
+// applying an optional video-container allow-list.
+func SelectEpisodeFileByContainers(files []FileStat, season, episode int, allowedContainers []string) (FileStat, bool) {
 	var best FileStat
 	var found bool
-	for _, f := range FilterEpisodeFiles(files) {
+	for _, f := range FilterEpisodeFilesByContainers(files, allowedContainers) {
 		fs, fe, ok := ParseEpisodeFromFilename(f.Path)
 		if !ok || fs != season || fe != episode {
 			continue
