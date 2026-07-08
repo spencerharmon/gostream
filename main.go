@@ -154,6 +154,43 @@ var stateDB *metadb.DB
 var physicalSourcePath string
 var virtualMountPath string
 
+// fuseMounted is set to 1 once the FUSE filesystem has been successfully mounted.
+// The /readyz readiness probe reads it atomically (the probe runs on the metrics
+// HTTP server, which starts before the mount completes).
+var fuseMounted int32
+
+// healthzHandler serves the Kubernetes liveness probe on the metrics port.
+// It is deliberately dependency-free: a 200 means only that the process is up
+// and this HTTP server is accepting connections. It must not touch FUSE, the DB,
+// or any external upstream (Prowlarr/TMDB/Plex/GoStorm) so liveness never flaps
+// on their state and k8s never needlessly restarts a healthy pod.
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "ok")
+}
+
+// readyzHandler serves the Kubernetes readiness probe on the metrics port.
+// It returns 200 only when the pod can do its job: the FUSE filesystem is
+// mounted and, when the SQLite state DB is enabled, it is open. It reads only
+// local, owned state (an atomic flag plus in-process pointers) — never an
+// external upstream — so readiness cannot flap on Prowlarr/TMDB/Plex and the
+// check stays cheap and side-effect free (no filesystem or network I/O).
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	mounted := atomic.LoadInt32(&fuseMounted) == 1
+	// stateDB is only created when EnableStateDB is set; with it disabled the
+	// JSON-fallback path is a healthy state and the DB is not required.
+	dbReady := !globalConfig.EnableStateDB || stateDB != nil
+	if mounted && dbReady {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "ok")
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	fmt.Fprintf(w, "not ready: fuse_mounted=%t db_ready=%t\n", mounted, dbReady)
+}
+
 var backgroundStopChan = make(chan struct{})
 var backgroundStopOnce sync.Once
 
@@ -3189,6 +3226,21 @@ func main() {
 			globalConfig.MaxConnsPerHost)
 	})
 
+	// Kubernetes liveness probe. Cheap and dependency-free: a 200 means the
+	// process is up and this HTTP server is accepting connections. It MUST NOT
+	// touch FUSE, the DB, or any external upstream (Prowlarr/TMDB/Plex/GoStorm)
+	// so liveness never flaps on their state and k8s never needlessly kills a
+	// healthy pod. This handler is registered before ListenAndServe(:MetricsPort)
+	// and before the FUSE mount, so it answers as soon as the port is open.
+	http.HandleFunc("/healthz", healthzHandler)
+
+	// Kubernetes readiness probe. 200 when the pod can do its job: the FUSE
+	// filesystem is mounted and, when the SQLite state DB is enabled, it is open.
+	// Reflects only local, owned state — never an external upstream — so readiness
+	// cannot flap on Prowlarr/TMDB/Plex availability. Cheap + side-effect free:
+	// an atomic load plus two pointer/bool reads, no filesystem or network I/O.
+	http.HandleFunc("/readyz", readyzHandler)
+
 	http.HandleFunc("/control", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write(settingsHTML)
@@ -3495,6 +3547,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// Signal readiness: the FUSE filesystem is now mounted (read by /readyz).
+	atomic.StoreInt32(&fuseMounted, 1)
 
 	logger.Printf("FUSE mounted at %s with VirtualMkvRoot, all systems active", mount)
 
