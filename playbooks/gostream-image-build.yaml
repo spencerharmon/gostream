@@ -1,0 +1,40 @@
+# gostream-image-build — builds the container image from docker/Dockerfile,
+# proving it still builds on every change (the check/gate half of what the old
+# GitHub Actions docker-publish workflow did). Multi-arch cross-build, registry
+# push and the Docker Hub description update are the LIVE publish path (registry
+# secrets + a tag-triggered pipeline) and are intentionally NOT done here — see
+# docs/tasks/zuul-ci.md. The build node must provide Docker + buildx.
+
+# HONESTY GUARD (see gostream-build-test.yaml): fail loudly when flux's Nodepool
+# assigned no build node, so a missing image-build node is an honest red rather
+# than a play that matches zero hosts and reports green without building.
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: refuse to pass without a real build node (no Nodepool provider yet)
+      ansible.builtin.fail:
+        msg: >-
+          gostream-image-build requires a Nodepool-provided build node with
+          Docker + buildx. None was assigned — flux's Nodepool provider is not
+          deployed yet. Failing honestly rather than skipping the image build and
+          reporting green.
+      when: groups['all'] | length == 0
+
+- hosts: all
+  tasks:
+    - name: resolve the gostream checkout path
+      ansible.builtin.set_fact:
+        gostream_src: "{{ ansible_user_dir }}/{{ zuul.project.src_dir }}"
+
+    - name: build the gostream container image for the node's native arch (no push)
+      ansible.builtin.shell: |
+        set -eu
+        docker buildx build \
+          --file docker/Dockerfile \
+          --build-arg APP_VERSION=zuul-ci \
+          --tag gostream:zuul-ci-check \
+          --load \
+          .
+      args:
+        chdir: "{{ gostream_src }}"
+        executable: /bin/sh
