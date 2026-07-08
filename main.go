@@ -154,6 +154,13 @@ var stateDB *metadb.DB
 var physicalSourcePath string
 var virtualMountPath string
 
+// fuseMountReady flips true exactly once, right after fs.Mount() succeeds
+// (main.go, near server.Wait()). Backs /readyz: read as a plain flag rather
+// than stat-ing the mount point, since a wedged FUSE mount can block a
+// syscall indefinitely (see smbdWatchdog) — a probe handler must never risk
+// hanging on that.
+var fuseMountReady atomic.Bool
+
 var backgroundStopChan = make(chan struct{})
 var backgroundStopOnce sync.Once
 
@@ -2873,6 +2880,39 @@ func restorePlaybackStates(db *metadb.DB) {
 //go:embed settings.html
 var settingsHTML []byte
 
+// healthzHandler is the k8s liveness probe: process up, HTTP mux answering.
+// Deliberately cheap and side-effect free — no dependency, external-upstream,
+// disk, or lock touches — so it can never flap on Prowlarr/TMDB/Plex/GoStorm
+// being slow or down. Reaching this handler at all is the only signal it
+// reports: a 200 with a tiny static body.
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, "ok\n")
+}
+
+// readyzHandler is the k8s readiness probe: FUSE mounted + (if enabled)
+// gostream.db open. Both checks are pre-computed, in-memory flags — never a
+// live stat()/query against the mount or DB — because a wedged FUSE mount can
+// block a syscall indefinitely (see smbdWatchdog) and that must never hang a
+// probe handler. No external-upstream (Prowlarr/TMDB/Plex) check is included,
+// so readiness never flaps on those being unreachable.
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	fuseOK := fuseMountReady.Load()
+	// gostream.db is optional (config.EnableStateDB); when disabled there is
+	// nothing to be "open", so that leg of the check is vacuously true.
+	dbOK := !globalConfig.EnableStateDB || stateDB != nil
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if fuseOK && dbOK {
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "ok\n")
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	fmt.Fprintf(w, "not ready: fuse_mounted=%v state_db_open=%v\n", fuseOK, dbOK)
+}
+
 func main() {
 	var dbPath string
 	flag.StringVar(&dbPath, "path", "", "path to database and config")
@@ -3411,6 +3451,14 @@ func main() {
 	})
 	logger.Printf("[Dashboard] enabled at :%d/dashboard", globalConfig.MetricsPort)
 
+	// Kubernetes liveness/readiness probes (same :9080 mux as everything above).
+	// Deliberately NOT reusing /api/health: that endpoint always answers 200
+	// regardless of internal state (it's a dashboard data feed, not a health
+	// gate) and its body depends on GoStorm/Plex/NAT-PMP reachability, which
+	// would make a liveness/readiness probe flap on external upstreams.
+	http.HandleFunc("/healthz", healthzHandler)
+	http.HandleFunc("/readyz", readyzHandler)
+
 	go http.ListenAndServe(fmt.Sprintf(":%d", globalConfig.MetricsPort), nil)
 
 	// Graceful shutdown: saves inode map and sync caches before exit.
@@ -3497,6 +3545,7 @@ func main() {
 	}
 
 	logger.Printf("FUSE mounted at %s with VirtualMkvRoot, all systems active", mount)
+	fuseMountReady.Store(true) // gates /readyz — see readyzHandler
 
 	go smbdWatchdog()
 
