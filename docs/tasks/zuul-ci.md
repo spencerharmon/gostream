@@ -96,6 +96,10 @@ to build/test CI, and are untouched.
   gofmt drift in 13 files; this task normalized them with `gofmt -w` (pure
   formatting, no semantic change) so the gate — and the hive's own handoff gofmt
   check — passes cleanly.
+- **go vet**: the job runs `go vet ./...`. The tree had one pre-existing vet
+  failure — `internal/ai/tuner.go` used an unescaped `%` in a `fmt.Sprintf`
+  format string (`(target <60%)`), which vet reads as an unknown verb `)`. Fixed
+  to `%%` (correct literal-percent escaping); `go vet ./...` is now clean.
 - **Build commands**: identical to `docker/Dockerfile` / README "Build from
   Source", which already produce released images — so they are proven-correct.
   A local `CGO_ENABLED=1 go build` compiles all gostream + cgo sources and
