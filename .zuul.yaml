@@ -1,0 +1,73 @@
+# Zuul CI pipeline for gostream, run on the swarm's self-hosted Zuul (deployed
+# into the k3s cluster by the flux submodule's `zuul` task) — NOT GitHub
+# Actions. See docs/tasks/zuul-ci.md for the full rationale, the
+# GitHub-Actions -> Zuul migration, and the pending-Nodepool cross-dep.
+#
+# HONEST NODEPOOL GATING (do not "fake green"):
+# Every job below performs a REAL build/test/image step and REQUIRES a
+# Nodepool-provided executor node to run:
+#   * gostream-build-test needs a Linux node with a Go toolchain (>= go.mod's
+#     `go 1.24.0`), libfuse3-dev, build-essential and pkg-config — gostream is a
+#     cgo binary (github.com/hanwen/go-fuse), so it MUST build CGO_ENABLED=1 and
+#     canNOT be the CGO_ENABLED=0 static build the shared Zuul-CI convention
+#     assumes for pure-Go components (see docs/tasks/zuul-ci.md).
+#   * gostream-image-build needs a Linux node with Docker + buildx.
+# flux has no Nodepool build-node provider deployed yet, so these jobs canNOT
+# execute today. Rather than stub them green, each playbook opens with a
+# localhost guard that FAILS the job when no build node was assigned
+# (playbooks/gostream-*.yaml) — a missing node yields an honest red, never a
+# silent green.
+#
+# `nodeset:` is deliberately OMITTED (each job inherits whatever nodeset the
+# tenant's base job eventually defines). Hardcoding a Nodepool label here would
+# be an unconfirmed guess — the concrete label ships with flux's Nodepool work.
+#
+# CROSS-DEP (recorded for the next reconcile): this pipeline's live execution
+# depends on flux's Nodepool provider task. The concrete `flux:<taskid>` is NOT
+# invented here — it does not exist yet; the next reconcile attaches it to this
+# task's PLAN.md deps once flux's Nodepool task id is known (the gostream <-> flux
+# SUBMODULE-LINKS.yaml link authorizes that qualified cross-submodule dep).
+
+- job:
+    name: gostream-build-test
+    description: >
+      gofmt / go vet / go build / go test for gostream — the non-image half of
+      CI. gostream links FUSE via cgo, so build and test run CGO_ENABLED=1
+      (the CGO_ENABLED=0 static-binary convention does not apply here). The node
+      must provide the Go toolchain plus libfuse3-dev, build-essential and
+      pkg-config. Needs a Nodepool build node (none deployed yet — the playbook
+      fails honestly rather than skipping to green).
+    run: playbooks/gostream-build-test.yaml
+    timeout: 1800
+
+- job:
+    name: gostream-image-build
+    description: >
+      Builds the gostream container image from docker/Dockerfile (the same
+      multi-stage, CGO_ENABLED=1 build the GitHub Actions docker-publish
+      workflow used) for the node's native architecture with `docker buildx
+      --load`, proving the image builds on every change. Multi-arch cross-build,
+      registry push and the Docker Hub description update stay in the live
+      publish path (secrets + a tag-triggered pipeline) — see docs/tasks/zuul-ci.md.
+      Needs a Nodepool build node with Docker + buildx (none deployed yet — the
+      playbook fails honestly rather than skipping to green).
+    run: playbooks/gostream-image-build.yaml
+    timeout: 1800
+
+# Attaches gostream's jobs to check + gate — the only pipelines the flux `zuul`
+# tenant config is confirmed to define (a minimal check/gate is enough to prove
+# the tenant loads). gostream is an untrusted project here, so it can only
+# attach jobs to pipelines the config-project already defines, not declare a new
+# `pipeline:` object. `name:` is omitted so it defaults to this project as the
+# git connection names it. A dedicated tag-triggered release/publish pipeline
+# (where multi-arch push + registry publish belong) is a follow-up once flux's
+# tenant config grows one; see docs/tasks/zuul-ci.md.
+- project:
+    check:
+      jobs:
+        - gostream-build-test
+        - gostream-image-build
+    gate:
+      jobs:
+        - gostream-build-test
+        - gostream-image-build

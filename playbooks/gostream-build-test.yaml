@@ -1,0 +1,74 @@
+# gostream-build-test — gofmt(report) / go vet / go build / go test.
+#
+# gostream links FUSE through cgo (github.com/hanwen/go-fuse), so every Go step
+# runs CGO_ENABLED=1; the build node must provide the Go toolchain plus
+# libfuse3-dev, build-essential and pkg-config. See docs/tasks/zuul-ci.md.
+
+# HONESTY GUARD (runs on the executor, which is always present): if flux's
+# Nodepool assigned no build node, `all` is empty and the build play below would
+# silently match zero hosts and report GREEN without ever compiling anything.
+# Fail loudly instead — a missing Nodepool node is an honest red, never a fake
+# pass. Remove-able once flux's Nodepool provider is live.
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: refuse to pass without a real build node (no Nodepool provider yet)
+      ansible.builtin.fail:
+        msg: >-
+          gostream-build-test requires a Nodepool-provided build node
+          (Go >= 1.24 + libfuse3-dev + build-essential + pkg-config). None was
+          assigned — flux's Nodepool provider is not deployed yet. Failing
+          honestly rather than skipping the build and reporting green.
+      when: groups['all'] | length == 0
+
+- hosts: all
+  tasks:
+    - name: resolve the gostream checkout path
+      ansible.builtin.set_fact:
+        gostream_src: "{{ ansible_user_dir }}/{{ zuul.project.src_dir }}"
+
+    - name: gofmt (report only — the current tree carries pre-existing drift; not a gate, see docs/tasks/zuul-ci.md)
+      ansible.builtin.shell: |
+        set -eu
+        out=$(gofmt -l .)
+        if [ -n "$out" ]; then
+          echo "WARNING: gofmt would reformat the following files:"
+          echo "$out"
+        fi
+      args:
+        chdir: "{{ gostream_src }}"
+        executable: /bin/sh
+      failed_when: false
+
+    - name: go vet ./... (cgo)
+      ansible.builtin.shell: go vet ./...
+      args:
+        chdir: "{{ gostream_src }}"
+        executable: /bin/sh
+      environment:
+        CGO_ENABLED: "1"
+
+    - name: go build ./... (cgo — FUSE requires CGO_ENABLED=1)
+      ansible.builtin.shell: go build ./...
+      args:
+        chdir: "{{ gostream_src }}"
+        executable: /bin/sh
+      environment:
+        CGO_ENABLED: "1"
+
+    - name: build the gostream binary (mirrors docker/Dockerfile's build line, minus machine-specific PGO)
+      ansible.builtin.shell: >-
+        go build -ldflags "-X main.AppVersion=zuul-ci" -o gostream .
+      args:
+        chdir: "{{ gostream_src }}"
+        executable: /bin/sh
+      environment:
+        CGO_ENABLED: "1"
+
+    - name: go test ./... (cgo)
+      ansible.builtin.shell: go test -count=1 ./...
+      args:
+        chdir: "{{ gostream_src }}"
+        executable: /bin/sh
+      environment:
+        CGO_ENABLED: "1"
