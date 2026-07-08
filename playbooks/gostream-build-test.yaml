@@ -27,18 +27,18 @@
       ansible.builtin.set_fact:
         gostream_src: "{{ ansible_user_dir }}/{{ zuul.project.src_dir }}"
 
-    - name: gofmt (report only — the current tree carries pre-existing drift; not a gate, see docs/tasks/zuul-ci.md)
+    - name: gofmt (must report zero files)
       ansible.builtin.shell: |
         set -eu
         out=$(gofmt -l .)
         if [ -n "$out" ]; then
-          echo "WARNING: gofmt would reformat the following files:"
-          echo "$out"
+          echo "gofmt would reformat the following files:" >&2
+          echo "$out" >&2
+          exit 1
         fi
       args:
         chdir: "{{ gostream_src }}"
         executable: /bin/sh
-      failed_when: false
 
     - name: go vet ./... (cgo)
       ansible.builtin.shell: go vet ./...

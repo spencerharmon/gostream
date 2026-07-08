@@ -917,7 +917,7 @@ jobs run in both the `check` and `gate` pipelines:
 
 | Job | What it does |
 |-----|--------------|
-| `gostream-build-test` | `gofmt` (report-only), `go vet`, `go build ./...`, the `gostream` binary build, and `go test ./...` — all `CGO_ENABLED=1` (gostream links FUSE via cgo). |
+| `gostream-build-test` | `gofmt` (must be clean), `go vet`, `go build ./...`, the `gostream` binary build, and `go test ./...` — all `CGO_ENABLED=1` (gostream links FUSE via cgo). |
 | `gostream-image-build` | Builds the container image from `docker/Dockerfile` for the runner's native arch, proving it still builds on every change. |
 
 **Migration from GitHub Actions.** These jobs replace the *build* half of the old

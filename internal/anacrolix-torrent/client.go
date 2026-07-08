@@ -80,7 +80,7 @@ type Client struct {
 	torrents          map[InfoHash]*Torrent
 	pieceRequestOrder map[interface{}]*request_strategy.PieceRequestOrder
 
-	acceptLimiter map[ipStr]int
+	acceptLimiter      map[ipStr]int
 	numHalfOpen        int
 	activePieceHashers int // client-level cap: max runtime.NumCPU() concurrent hashers
 

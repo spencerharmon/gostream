@@ -8,8 +8,8 @@ of beehive's `release-verify` Zuul wiring.
 ## What ships
 
 - **`.zuul.yaml`** — job + project definitions:
-  - `gostream-build-test` — gofmt (report-only), `go vet`, `go build ./...`,
-    the `gostream` binary build, and `go test -count=1 ./...`.
+  - `gostream-build-test` — `gofmt -l` (must report zero files), `go vet`,
+    `go build ./...`, the `gostream` binary build, and `go test -count=1 ./...`.
   - `gostream-image-build` — builds the container image from `docker/Dockerfile`
     for the node's native arch (`docker buildx --load`), proving the image still
     builds on every change.
@@ -91,6 +91,11 @@ to build/test CI, and are untouched.
 - **YAML**: `.zuul.yaml` and both playbooks parse via `python3 yaml.safe_load`;
   structural checks confirm every `project:` check/gate job maps to a defined
   `job:` and every job's `run:` playbook exists on disk.
+- **gofmt**: the `gostream-build-test` job enforces `gofmt -l .` == empty as a
+  hard gate (mirroring beehive's `release-verify`). The tree carried pre-existing
+  gofmt drift in 13 files; this task normalized them with `gofmt -w` (pure
+  formatting, no semantic change) so the gate — and the hive's own handoff gofmt
+  check — passes cleanly.
 - **Build commands**: identical to `docker/Dockerfile` / README "Build from
   Source", which already produce released images — so they are proven-correct.
   A local `CGO_ENABLED=1 go build` compiles all gostream + cgo sources and
