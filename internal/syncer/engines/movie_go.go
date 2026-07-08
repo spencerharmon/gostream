@@ -655,7 +655,6 @@ func (e *MovieGoEngine) extractMovieSeeders(title string) int {
 	return 0
 }
 
-
 func (e *MovieGoEngine) resolveIMDB(ctx context.Context, tmdbID int, title string) string {
 	// Check cache
 	if entry, ok := e.imdbCache[strconv.Itoa(tmdbID)]; ok {
@@ -917,5 +916,3 @@ func (e *MovieGoEngine) saveIMDBCache(file string, data map[string]IMDBCacheEntr
 	os.WriteFile(tmp, jsonData, 0644)
 	os.Rename(tmp, file)
 }
-
-
