@@ -1,0 +1,102 @@
+# FUSE mount-propagation reference fragment — gostream + jellyfin in ONE Pod.
+#
+# NOT a deployable manifest. This is the co-location contract the
+# `k8s-reference-manifests` capstone composes and flux's
+# `phantom-library-bluegreen-deploy` adapts into the live blue/green overlay.
+# It carries ONLY the pieces that make gostream's in-container FUSE mount
+# surface to a co-located jellyfin exactly as it surfaces to the host today —
+# by mount *propagation*, not a network share. Config (config-secret), state
+# (state-pvc), probes (healthz-probe), Service/ports and resource limits are
+# elided here and owned by their tasks / the capstone; comments mark the seams.
+#
+# Mechanism (see README.md "FUSE mount propagation to co-located jellyfin"):
+#   1. `virtual-mkv` is a hostPath (`/var/gostream/gostream-mkv-virtual`) — the
+#      direct k8s analog of today's host `rshared` bind. Both containers mount
+#      the SAME host source, so they share one mount peer group.
+#   2. gostream mounts it `Bidirectional` (== rshared) and FUSE-mounts on top of
+#      it. The new FUSE mount propagates UP to the host peer group.
+#   3. jellyfin mounts the SAME source `HostToContainer` (== rslave), read-only,
+#      so that FUSE mount propagates DOWN into jellyfin. Propagation keys off the
+#      shared SOURCE, not a matching mountPath — the two mountPaths differ on
+#      purpose to show that.
+#   4. gostream's FUSE mount is created with `allow_other` (main.go sets
+#      AllowOther: true); privileged/root satisfies libfuse's allow_other gate
+#      without `/etc/fuse.conf`, so jellyfin's UID can traverse the tree.
+#
+# Bidirectional propagation is permitted by kubelet ONLY for privileged
+# containers, so gostream MUST be `privileged: true` (this also provides
+# `/dev/fuse` + CAP_SYS_ADMIN the FUSE mount needs). jellyfin stays unprivileged.
+# See README.md "Privileged-FUSE security tradeoff" and "SMB/CSI (untested
+# non-default)".
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gostream-jellyfin-fuse-ref
+  namespace: gostream
+  labels:
+    app.kubernetes.io/name: gostream
+    app.kubernetes.io/component: fuse-propagation-reference
+  annotations:
+    gostream.dev/reference-only: >-
+      Not applied directly. Consumed by k8s-reference-manifests (gostream) and
+      phantom-library-bluegreen-deploy (flux). Live propagation verification is
+      flux's job — see README.md.
+spec:
+  # Single node `spray`; both containers must co-locate for propagation to work
+  # (they share the node's mount namespace via the hostPath peer group).
+  containers:
+    # ----- gostream: the FUSE producer (privileged, Bidirectional) -----------
+    - name: gostream
+      image: docker.io/mrrobotogit/gostream:testing
+      # k8s-image tunes this image (PID1/clean-TERM unmount, GOMEMLIMIT default,
+      # fail-loud without /dev/fuse+SYS_ADMIN). Contract: ports 8080/9080/8090.
+      securityContext:
+        # REQUIRED. Bidirectional mountPropagation is allowed only in privileged
+        # containers; privileged also supplies /dev/fuse + CAP_SYS_ADMIN for the
+        # FUSE mount. You CANNOT keep Bidirectional with "just" SYS_ADMIN — see
+        # the README tradeoff for the (non-default) device-plugin path to drop it.
+        privileged: true
+      env:
+        # gostream FUSE-mounts at its config `fuse_mount_path`; keep it equal to
+        # the Bidirectional volumeMount mountPath below so the FUSE mount lands
+        # on the propagating mount.
+        - name: MKV_PROXY_CONFIG_PATH
+          value: /etc/gostream/config.json # config-secret owns the merged file
+        - name: GOMEMLIMIT
+          value: 2200MiB # k8s-image default; capstone may override
+      ports:
+        - { name: proxy, containerPort: 8080 }
+        - { name: metrics, containerPort: 9080 } # healthz-probe: liveness/readiness
+        - { name: gostorm, containerPort: 8090 }
+      volumeMounts:
+        - name: virtual-mkv
+          mountPath: /mnt/gostream-mkv-virtual # == config fuse_mount_path
+          mountPropagation: Bidirectional
+        # config-secret (/etc/gostream) and state-pvc (/usr/local/state) mounts
+        # are added by the capstone; omitted here to keep the fragment about FUSE.
+    # ----- jellyfin: the FUSE consumer (unprivileged, HostToContainer RO) -----
+    - name: jellyfin
+      # Placeholder: flux supplies the REAL patched jellyfin image + full config
+      # (this fragment fixes only the co-location/propagation contract).
+      image: docker.io/jellyfin/jellyfin:latest
+      securityContext:
+        privileged: false # consumer needs no privilege — it only reads
+        allowPrivilegeEscalation: false
+      volumeMounts:
+        - name: virtual-mkv
+          # Deliberately a DIFFERENT path than gostream's: propagation follows
+          # the shared hostPath SOURCE, not the in-container mountPath. Point
+          # jellyfin's library at this path.
+          mountPath: /media/gostream
+          mountPropagation: HostToContainer # == rslave: receive gostream's mount
+          readOnly: true # jellyfin only reads the virtual .mkv tree
+  volumes:
+    # Shared virtual-mkv volume — hostPath, the analog of today's host rshared
+    # bind at /var/gostream/gostream-mkv-virtual. Chosen over emptyDir because it
+    # is the documented, proven Bidirectional pattern and survives container
+    # restarts (gostream re-mounts into the same host dir). See README for the
+    # emptyDir tradeoff and the node `mount --make-rshared /` prerequisite.
+    - name: virtual-mkv
+      hostPath:
+        path: /var/gostream/gostream-mkv-virtual
+        type: DirectoryOrCreate
