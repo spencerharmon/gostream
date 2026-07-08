@@ -1,0 +1,30 @@
+# OPTIONAL — SSD warm cache for gostream.
+#
+# Mounted at /usr/local/state/warmup (a subpath of the state root). Holds ONLY
+# transient, reconstructible warm-cache data — NO permanent inode map. It is
+# therefore WIPE-SAFE and deliberately does NOT carry the prune-disabled guard the
+# state claim has: losing this cache costs a re-warm, never library integrity.
+#
+# Deploy only if a fast SSD warm cache is wanted. Shared read-write across blue and
+# green (same node, same RWO rules as the state claim). The reference Pod that
+# binds it is owned by k8s-reference-manifests.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gostream-warmup
+  labels:
+    app.kubernetes.io/name: gostream
+    app.kubernetes.io/component: warmup-cache
+    app.kubernetes.io/part-of: phantom-library
+spec:
+  # RWO, single node (spray) — same shared-across-colors rationale as the state
+  # claim. NOT ReadWriteOncePod, so both colors can mount it on the node.
+  accessModes:
+    - ReadWriteOnce
+  # Point at an SSD-backed StorageClass if one exists on spray; falls back to the
+  # k3s built-in provisioner otherwise. Override in the flux overlay.
+  storageClassName: local-path
+  resources:
+    requests:
+      # Reference default for a warm cache; size to the working set. Reconstructible.
+      storage: 50Gi
