@@ -1,0 +1,30 @@
+# gostream single-color reference BASE (k8s-reference-manifests capstone).
+#
+# `kubectl kustomize deploy/k8s` builds the composable single-color reference that
+# flux's `phantom-library-bluegreen-deploy` consumes and layers its blue/green
+# overlay on top of. This is a REFERENCE base, not a live apply target.
+#
+# Included here = the pieces that are safe and complete as a single-color base:
+#   - deployment.yaml  — the gostream container (this task)
+#   - service.yaml     — the ClusterIP fronting :8080/:9080/:8090 (this task)
+#   - configmap.yaml   — non-secret tuning (config-secret task); schema-stable
+#
+# DELIBERATELY EXCLUDED (owned elsewhere / overlaid by flux) — do not add here:
+#   - secret.sops.example.yaml — schema/example ONLY; the REAL Secret is SOPS-encrypted
+#     in flux's tree. flux supplies `gostream-config-secret` in its overlay.
+#   - state-pvc.yaml / warmup-pvc.yaml — shipped by the state-pvc task; the Deployment
+#     references the `gostream-state` claim by name. flux includes the PVC(s) in its
+#     overlay so the same claim is shared across blue+green.
+#   - pod-fuse-fragment.yaml — a reference-ONLY two-container Pod illustrating the FUSE
+#     propagation pairing; never applied.
+#   - the jellyfin sidecar + blue/green color patches — flux's job (added as a second
+#     container + per-color name/label patches over this base).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: gostream
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - configmap.yaml

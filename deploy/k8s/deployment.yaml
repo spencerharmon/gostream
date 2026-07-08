@@ -1,0 +1,207 @@
+# gostream reference Deployment — the integration capstone (k8s-reference-manifests).
+#
+# This is the single-color REFERENCE spec that flux's `phantom-library-bluegreen-deploy`
+# consumes and ADAPTS into its live blue/green overlay. It is NOT the live deployment:
+# the real blue/green color patches, the patched jellyfin sidecar, and the SOPS-encrypted
+# Secret all live in flux's tree and are layered on top of this base. See README.md
+# ("Reference Deployment/Service (the capstone)") for the compose map and the
+# hostNetwork-vs-Service networking decision.
+#
+# It COMPOSES the four dependency contracts, each owned by its own task:
+#   - FUSE mount propagation (fuse-mount-propagation) — the shared `virtual-mkv`
+#     volume + gostream's Bidirectional/privileged mount, ready for flux to drop in
+#     the jellyfin `HostToContainer` RO sidecar. See pod-fuse-fragment.yaml.
+#   - State persistence (state-pvc) — binds the `gostream-state` PVC at
+#     /usr/local/state (GOSTREAM_ROOT_PATH); the sacred gostream.db inode map is
+#     never wiped. The PVC object itself ships from state-pvc.yaml (that task).
+#   - Split config (config-secret) — ConfigMap `gostream-config` + Secret
+#     `gostream-config-secret` deep-merged by the entrypoint into one
+#     /etc/gostream/config.json (MKV_PROXY_CONFIG_PATH).
+#   - Health probes (healthz-probe) — liveness /healthz + readiness /readyz on :9080.
+#
+# Image contract is shared with the `k8s-image` sibling and pinned facts live in
+# submodules/gostream/ARTIFACTS.md — do not re-derive them here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gostream
+  namespace: gostream
+  labels:
+    app.kubernetes.io/name: gostream
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/part-of: phantom-library
+  annotations:
+    gostream.dev/reference-only: >-
+      Single-color reference. flux's phantom-library-bluegreen-deploy adapts this
+      into the live blue/green overlay (color patches + jellyfin sidecar + SOPS
+      Secret). Live in-cluster bring-up and propagation verification are flux's job.
+spec:
+  # Single color = single replica. Blue/green runs TWO of these (one per color) with
+  # flux's Service flipping between them; that is flux's overlay, not this reference.
+  replicas: 1
+  # Recreate, NOT RollingUpdate: one color must not double-bind the FUSE hostPath
+  # (Bidirectional propagation) or the RWO state PVC with itself during a redeploy —
+  # tear the old pod down before starting the new one. Cross-COLOR overlap (blue up
+  # while green drains) is flux's cutover sequencing concern, handled in its overlay.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gostream
+      app.kubernetes.io/component: proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gostream
+        app.kubernetes.io/component: proxy
+        app.kubernetes.io/part-of: phantom-library
+    spec:
+      # Networking decision (recorded in full in README "Networking: ClusterIP Service,
+      # not hostNetwork"): pod networking + a ClusterIP Service, NOT hostNetwork.
+      # Blue/green needs two colors co-resident on the single node `spray`; hostNetwork
+      # would make both fight for the same host ports (:8080/:9080/:8090 + the torrent
+      # port), so it is incompatible with the blue/green model this reference must feed.
+      # Inbound peer/torrent reachability is handled by gostream's built-in NAT-PMP
+      # (config `natpmp.*`, disabled by default) whose firewall/port-map work is
+      # nft/iptables-nft ONLY (never legacy iptables) — see README.
+      #
+      # Both colors must land on the one node that owns the FUSE hostPath + RWO state
+      # PVC. flux pins that in its overlay (nodeSelector/affinity for `spray`); it is
+      # left out of this reference so it carries no site-specific node name.
+      terminationGracePeriodSeconds: 60 # let gostream save the inode map + unmount FUSE
+      containers:
+        - name: gostream
+          # Same image the k8s-image sibling tunes (PID1/clean-TERM FUSE unmount,
+          # GOMEMLIMIT default, fail-loud without /dev/fuse+SYS_ADMIN, jq split-config
+          # merge). Port contract: 8080 (proxy, inert today), 9080 (HTTP surface +
+          # probes), 8090 (GoStorm engine). flux may repin the tag/digest per color.
+          image: docker.io/mrrobotogit/gostream:testing
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            # REQUIRED, not tunable: kubelet permits Bidirectional mountPropagation
+            # ONLY for privileged containers (admission keys on the privileged flag
+            # itself — you CANNOT keep Bidirectional with just SYS_ADMIN+/dev/fuse).
+            # privileged also supplies /dev/fuse + CAP_SYS_ADMIN (the FUSE mount) and
+            # CAP_NET_ADMIN (NAT-PMP / nft port-map). This is the single largest
+            # attack-surface item; it is bounded (only gostream is privileged; the
+            # jellyfin sidecar flux adds stays unprivileged + RO) and the non-default
+            # way to drop it (FUSE device plugin + caps, which LOSES Bidirectional and
+            # forces the SMB/CSI path) is recorded in README "Privileged-FUSE tradeoff".
+            privileged: true
+          env:
+            # --- Split config (config-secret): entrypoint deep-merges tuning+secret ---
+            - name: MKV_PROXY_CONFIG_PATH
+              value: /etc/gostream/config.json # single merged file gostream loads
+            - name: MKV_PROXY_CONFIG_TUNING_PATH
+              value: /config-src/tuning/config.tuning.json # from ConfigMap gostream-config
+            - name: MKV_PROXY_CONFIG_SECRET_PATH
+              value: /config-src/secret/config.secret.json # from Secret gostream-config-secret
+            # --- State (state-pvc): root path == the PVC mountPath, so gostream.db
+            #     (GetStateDir() = $GOSTREAM_ROOT_PATH/STATE) lands on persistent
+            #     storage. Never wiped. ---
+            - name: GOSTREAM_ROOT_PATH
+              value: /usr/local/state
+            # --- FUSE paths (fuse-mount-propagation): MOUNT_PATH is the propagating
+            #     Bidirectional mount; SOURCE_PATH holds the reconstructible library
+            #     stub tree. Kept equal to config fuse_mount_path/physical_source_path. ---
+            - name: GOSTREAM_MOUNT_PATH
+              value: /mnt/gostream-mkv-virtual
+            - name: GOSTREAM_SOURCE_PATH
+              value: /mnt/gostream-mkv-real
+            # --- GOMEMLIMIT: soft heap ceiling, carried from gostream.service's systemd
+            #     default. Set intentionally BELOW the container memory limit (3Gi) so
+            #     Go GCs hard before the cgroup OOM-kills, leaving headroom for the cgo/
+            #     FUSE + torrent off-heap buffers. Overrides the image ENV default. ---
+            - name: GOMEMLIMIT
+              value: 2200MiB
+          ports:
+            - { name: proxy, containerPort: 8080 } # inert today (see ARTIFACTS.md) — contract only
+            - { name: metrics, containerPort: 9080 } # HTTP surface + /healthz + /readyz
+            - { name: gostorm, containerPort: 8090 } # GoStorm engine API (binds all ifaces)
+          # Liveness/readiness on :9080 (healthz-probe). /healthz is always 200 once the
+          # process/mux is up; /readyz is 503 until FUSE is mounted (and gostream.db is
+          # open, if enabled) — no external-upstream (Plex/TMDB/GoStorm) flapping.
+          # Boot-order note (healthz-probe doc): the :9080 listener answers BEFORE
+          # fs.Mount() runs, so /healthz can be green while /readyz is still 503 — hence
+          # a generous readiness startup window below.
+          livenessProbe:
+            httpGet: { path: /healthz, port: 9080 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4 # lenient: only fires if the process/mux itself is dead
+          readinessProbe:
+            httpGet: { path: /readyz, port: 9080 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3 # tolerate the GoStorm-init + FUSE-mount window before first ready
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi # > GOMEMLIMIT (2200MiB) so GC pressure precedes any OOM kill
+          volumeMounts:
+            # FUSE producer mount — Bidirectional (== rshared). gostream FUSE-mounts on
+            # top of this; the mount propagates UP to the host peer group and DOWN into
+            # any co-located container mounting the SAME source HostToContainer (the
+            # jellyfin sidecar flux adds). See pod-fuse-fragment.yaml.
+            - name: virtual-mkv
+              mountPath: /mnt/gostream-mkv-virtual # == GOSTREAM_MOUNT_PATH / config fuse_mount_path
+              mountPropagation: Bidirectional
+            # Library stub source (physical_source_path). Holds lightweight stub .mkv
+            # files (movies/, tv/) the FUSE layer streams from torrents; reconstructible
+            # from the sacred inode map, so an emptyDir is acceptable for the reference.
+            - name: real-mkv
+              mountPath: /mnt/gostream-mkv-real # == GOSTREAM_SOURCE_PATH / config physical_source_path
+            # Persistent state (state-pvc): gostream.db inode map + sync/scheduler state
+            # + logs. Bound at GOSTREAM_ROOT_PATH. NEVER wiped/re-inited.
+            - name: state
+              mountPath: /usr/local/state
+            # Merged config output (writable emptyDir the entrypoint writes the merged
+            # config.json into) + the two read-only split-config sources.
+            - name: config-merged
+              mountPath: /etc/gostream
+            - name: config-tuning
+              mountPath: /config-src/tuning
+              readOnly: true
+            - name: config-secret
+              mountPath: /config-src/secret
+              readOnly: true
+          # --- flux adds the jellyfin sidecar HERE (second container) ---------------
+          # It mounts the SAME `virtual-mkv` volume `HostToContainer` (== rslave),
+          # readOnly, at its own path (e.g. /media/gostream) to RECEIVE gostream's FUSE
+          # mount by propagation. Unprivileged. Kept OUT of this single-color reference
+          # on purpose (real patched image + config are flux's); the propagation
+          # contract is illustrated end-to-end in pod-fuse-fragment.yaml.
+      volumes:
+        # Shared FUSE propagation volume — hostPath, the direct analog of today's host
+        # `rshared` bind at the same path. Node prereq: `/` is rshared (systemd default).
+        # See README "Shared-volume choice: hostPath" for the emptyDir tradeoff.
+        - name: virtual-mkv
+          hostPath:
+            path: /var/gostream/gostream-mkv-virtual
+            type: DirectoryOrCreate
+        # Reconstructible library stub tree — emptyDir for the reference. flux may
+        # promote this to a PVC if it wants to avoid stub-rebuild churn across restarts.
+        - name: real-mkv
+          emptyDir: {}
+        # Sacred persistent state. Claim shipped by state-pvc.yaml (state-pvc task);
+        # both blue/green colors reference this SAME claim so the inode map is
+        # byte-identical across a color flip (Jellyfin item IDs never churn). RWO (not
+        # RWOncePod) so both colors can co-mount it on the one node.
+        - name: state
+          persistentVolumeClaim:
+            claimName: gostream-state
+        # Optional SSD warm cache (state-pvc's gostream-warmup) can be added by flux as
+        # an extra volume mounted at /usr/local/state/warmup — reconstructible, wipe-safe.
+        - name: config-merged
+          emptyDir: {}
+        - name: config-tuning
+          configMap:
+            name: gostream-config # non-secret tuning (config-secret)
+        - name: config-secret
+          secret:
+            secretName: gostream-config-secret # SOPS-decrypted by flux in-cluster
