@@ -9,6 +9,40 @@ STATE_DIR="${GOSTREAM_STATE_DIR:-$ROOT_PATH/STATE}"
 LOG_DIR="${GOSTREAM_LOG_DIR:-$ROOT_PATH/logs}"
 HOST_MOUNT_HINT="${GOSTREAM_HOST_MOUNT_HINT:-}"
 
+# Fail loud (never silently degrade) when the runtime can't grant FUSE. Without
+# this check, a missing /dev/fuse or CAP_SYS_ADMIN only surfaces once gostream's
+# own fs.Mount() call fails deep inside startup (a go-fuse error via main.go's
+# `log.Fatal(err)`) — cryptic, and only after state/log dirs and config merge
+# have already run. Checking up front gives an operator-actionable message and
+# fails immediately, before touching anything else.
+require_fuse() {
+  if [ ! -e /dev/fuse ]; then
+    echo "FATAL: /dev/fuse is missing in this container." >&2
+    echo "  Docker: run with --device /dev/fuse" >&2
+    echo "  k8s:    mount /dev/fuse (hostPath device or a FUSE device plugin)" >&2
+    exit 1
+  fi
+
+  cap_eff="$(awk '/^CapEff:/ { print $2 }' /proc/self/status 2>/dev/null || true)"
+  if [ -z "$cap_eff" ]; then
+    echo "FATAL: could not read CapEff from /proc/self/status to verify CAP_SYS_ADMIN." >&2
+    echo "  gostream needs a normal /proc (not masked/restricted) to self-check caps." >&2
+    exit 1
+  fi
+
+  # CAP_SYS_ADMIN is capability bit 21 (mask 0x200000); fs.Mount() needs it to
+  # call mount(2) for the FUSE filesystem. --privileged also sets this bit, so
+  # one mask check covers both --cap-add SYS_ADMIN and full privileged.
+  if [ "$(( 0x$cap_eff & 0x200000 ))" -eq 0 ]; then
+    echo "FATAL: missing CAP_SYS_ADMIN, required to mount gostream's FUSE filesystem." >&2
+    echo "  Docker: run with --cap-add SYS_ADMIN (or --privileged)" >&2
+    echo "  k8s:    securityContext.capabilities.add: [SYS_ADMIN] (or privileged: true)" >&2
+    exit 1
+  fi
+}
+
+require_fuse
+
 # Optional split-config sources (Kubernetes ConfigMap + Secret). When BOTH are
 # set, the two JSON fragments are deep-merged into $CONFIG_PATH below. Unset for
 # single-file installs (Docker/systemd), which use $CONFIG_PATH verbatim.
@@ -94,24 +128,42 @@ fi
 
 gostream_pid=""
 
+# Relay INT/TERM to gostream and propagate its TRUE exit code — deliberately
+# NOT trapping EXIT (see below). Verified empirically (podman + tini): once a
+# trapped signal interrupts the `wait` below, control never returns to it —
+# dash ends the shell right after this handler returns, using the signal's
+# 128+n status, discarding whatever the interrupted `wait` would have reported.
+# So this handler owns the real reap and MUST `exit` explicitly with its code;
+# it cannot rely on falling through to the main flow's own wait/exit below.
+# `set +e`/`set -e` bracket the wait because `set -e` aborts the script the
+# instant a bare `wait` reports nonzero (e.g. gostream exits non-cleanly) —
+# without it, a non-zero exit would skip both the fusermount3 safety net and
+# this exit line entirely.
 shutdown() {
-  trap - INT TERM EXIT
+  trap - INT TERM
 
   if [ -n "$gostream_pid" ] && kill -0 "$gostream_pid" 2>/dev/null; then
     kill -TERM "$gostream_pid" 2>/dev/null || true
   fi
 
-  wait ${gostream_pid:+"$gostream_pid"} 2>/dev/null || true
+  set +e
+  wait ${gostream_pid:+"$gostream_pid"} 2>/dev/null
+  code=$?
+  set -e
+
   fusermount3 -uz "$MOUNT_PATH" 2>/dev/null || true
+  exit "$code"
 }
 
-trap shutdown INT TERM EXIT
+trap shutdown INT TERM
 
 echo "Starting gostream" >&2
 /usr/local/bin/gostream --path "$ROOT_PATH" "$SOURCE_PATH" "$MOUNT_PATH" &
 gostream_pid="$!"
 
+set +e
 wait "$gostream_pid"
 exit_code=$?
+set -e
 fusermount3 -uz "$MOUNT_PATH" 2>/dev/null || true
 exit "$exit_code"

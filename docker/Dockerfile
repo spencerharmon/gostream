@@ -40,7 +40,17 @@ ENV GOSTREAM_MOUNT_PATH=/mnt/gostream-mkv-virtual
 ENV GOSTREAM_STATE_DIR=/usr/local/STATE
 ENV GOSTREAM_LOG_DIR=/usr/local/logs
 
-EXPOSE 8090 9080
+# Soft memory cap, carried over from gostream.service's systemd default (see
+# ../gostream.service: "256MB+ RAM systems: 2200MiB is safe for Pi 4"). This is
+# a starting default, not a hardcoded ceiling: k8s/Docker callers override it by
+# setting the same-named env in the manifest/`-e` flag, which always wins over
+# this image default.
+ENV GOMEMLIMIT=2200MiB
+
+# :8080 (proxy_listen_port), :9080 (metrics/health/dashboard), :8090 (embedded
+# GoStorm engine) — the full image port contract, kept consistent with
+# deploy/k8s/configmap.yaml and the k8s-reference-manifests Service.
+EXPOSE 8080 8090 9080
 
 # tini is used as PID 1 to forward signals (e.g. SIGTERM on docker stop) to
 # gostream and reap zombie processes. Without it, the shell entrypoint script
