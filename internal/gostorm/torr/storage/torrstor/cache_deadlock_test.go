@@ -42,6 +42,10 @@ func TestCacheCleanPiecesNoDeadlock(t *testing.T) {
 		cleanTrigger:  make(chan struct{}, 1),
 		cleanStop:     make(chan struct{}),
 		localPriority: make(map[int]torrenttypes.PiecePriority),
+		// pieceInRange is the V305 in-range bitmap that getRemPieces indexes by
+		// piece id; NewCache sizes it to pieceCount, so mirror that invariant here
+		// (a bare literal leaves it nil → index-out-of-range in getRemPieces).
+		pieceInRange: make([]bool, pieceCount),
 		// torrent is intentionally nil → setLoadPriority / clearPriority are no-ops
 	}
 
