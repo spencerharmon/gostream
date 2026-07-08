@@ -1,11 +1,22 @@
 # gostream on Kubernetes — reference deployment pieces
 
-Reference building blocks the `k8s-reference-manifests` capstone composes into the
-Deployment/Service that flux's `phantom-library-bluegreen-deploy` consumes. Nothing
-here is applied directly. Pieces:
+Reference building blocks that the `k8s-reference-manifests` capstone composes into the
+single-color Deployment/Service that flux's `phantom-library-bluegreen-deploy` consumes
+and adapts. Nothing here is applied directly from this repo — flux owns the live
+blue/green overlay. Pieces:
 
+- **Reference Deployment + Service (the capstone)** — `deployment.yaml`,
+  `service.yaml`, `kustomization.yaml`: the single-color gostream spec that composes
+  the four pieces below (`kubectl kustomize deploy/k8s` builds it). See "Reference
+  Deployment/Service (the capstone)" and "Networking: ClusterIP Service, not
+  hostNetwork".
 - **Split config** — `configmap.yaml` + `secret.sops.example.yaml`, merged to one
   `/etc/gostream/config.json` at start (below).
+- **State persistence** — the `gostream-state` PVC (shipped by the `state-pvc` task's
+  `state-pvc.yaml`), bound at `/usr/local/state`; the sacred `gostream.db` inode map is
+  never wiped.
+- **Health probes** — `/healthz` (liveness) + `/readyz` (readiness) on `:9080` (the
+  `healthz-probe` task), wired into the Deployment.
 - **FUSE mount propagation** — `pod-fuse-fragment.yaml`, how gostream's in-container
   FUSE mount surfaces to a co-located jellyfin (see "FUSE mount propagation to
   co-located jellyfin").
@@ -247,3 +258,124 @@ kubectl create --dry-run=client -f deploy/k8s/pod-fuse-fragment.yaml -o name
 claim a live propagation pass from this repo — this task ships the design + the
 reference fragment only. In-cluster, the check is: exec into jellyfin and confirm the
 gostream FUSE tree is visible read-only under its mountPath while gostream is running.
+
+# Reference Deployment/Service (the capstone)
+
+`deployment.yaml` + `service.yaml` + `kustomization.yaml` are the **integration
+capstone** (`k8s-reference-manifests`): the single-color gostream reference that flux's
+`phantom-library-bluegreen-deploy` consumes and adapts. `kubectl kustomize deploy/k8s`
+builds the composed base (Deployment + Service + tuning ConfigMap). It is a
+**reference**, not a live apply target — flux layers the blue/green color patches, the
+jellyfin sidecar, and the real SOPS Secret on top.
+
+## What it composes (each dep → what it contributes)
+
+| Dep task | Contributes | Where in the Deployment |
+|----------|-------------|-------------------------|
+| **fuse-mount-propagation** | shared `virtual-mkv` hostPath + gostream's `Bidirectional`/`privileged` FUSE mount; the seam for flux's jellyfin `HostToContainer` RO sidecar | `virtual-mkv` volume + mount at `/mnt/gostream-mkv-virtual` |
+| **state-pvc** | `gostream-state` PVC bound at `/usr/local/state` (`GOSTREAM_ROOT_PATH`); `gostream.db` inode map never wiped | `state` volume (`claimName: gostream-state`) |
+| **config-secret** | ConfigMap `gostream-config` + Secret `gostream-config-secret`, deep-merged by the entrypoint into one `/etc/gostream/config.json` | `config-tuning`/`config-secret` (RO sources) + `config-merged` emptyDir |
+| **healthz-probe** | `/healthz` (liveness) + `/readyz` (readiness) on `:9080`, no external-upstream flapping | `livenessProbe`/`readinessProbe` |
+| **k8s-image** (sibling) | the tuned `docker.io/mrrobotogit/gostream:testing` image + port/GOMEMLIMIT/fail-loud contract (`ARTIFACTS.md`) | container `image`, ports, `GOMEMLIMIT` |
+
+### Env / state contract (do not drift from the entrypoint)
+
+The entrypoint (`docker/docker-entrypoint.sh`) reads these; the Deployment sets them so
+the PVC mount, FUSE paths, and merged config all agree:
+
+- `MKV_PROXY_CONFIG_PATH=/etc/gostream/config.json` — the single merged file gostream loads.
+- `MKV_PROXY_CONFIG_TUNING_PATH` / `MKV_PROXY_CONFIG_SECRET_PATH` — the two split sources
+  the entrypoint `jq`-deep-merges (see "Merge mechanism").
+- `GOSTREAM_ROOT_PATH=/usr/local/state` — equals the state PVC mountPath, so
+  `GetStateDir()` (`$ROOT_PATH/STATE`) lands `gostream.db` on the persistent claim. The
+  image's own default is `/usr/local`; the k8s contract is `/usr/local/state` and this
+  reference sets it explicitly so the mount and env agree (see the `state-pvc` doc).
+- `GOSTREAM_MOUNT_PATH=/mnt/gostream-mkv-virtual` / `GOSTREAM_SOURCE_PATH=/mnt/gostream-mkv-real`
+  — the FUSE mount target (== `virtual-mkv`, Bidirectional) and the reconstructible
+  library-stub source (== `real-mkv`, an emptyDir here).
+- `GOMEMLIMIT=2200MiB` — carried from `gostream.service`, set BELOW the container memory
+  limit (see below).
+
+### What flux adds on top (kept OUT of this single-color reference on purpose)
+
+- The **jellyfin sidecar** — a second container in the same Pod, mounting `virtual-mkv`
+  `HostToContainer` RO at its own path to receive gostream's FUSE mount by propagation
+  (illustrated end-to-end in `pod-fuse-fragment.yaml`).
+- The **blue/green color overlay** — per-color name/label patches + a second replica set;
+  both colors reference the SAME `gostream-state` claim so the inode map is byte-identical
+  across a flip.
+- The **real Secret** — `gostream-config-secret`, SOPS-encrypted in flux's tree
+  (`secret.sops.example.yaml` here is schema-only).
+- The `spray` **nodeSelector/affinity** — both colors must co-locate on the one node that
+  owns the FUSE hostPath + RWO state PVC (left out here so the reference carries no
+  site-specific node name).
+
+## Networking: ClusterIP Service, not hostNetwork (decision recorded)
+
+**Decision: pod networking + a ClusterIP Service; NOT `hostNetwork`.** The ROI asked to
+"decide + document hostNetwork vs ClusterIP Service for peer/torrent connectivity."
+
+**Why ClusterIP over hostNetwork:** blue/green (flux's job, which this reference must
+feed) needs two colors running **at once on the single node** during a cutover.
+`hostNetwork: true` puts the pod in the node's network namespace, so both colors would
+fight for the same host ports (`:8080`/`:9080`/`:8090` **and** the torrent listen port)
+— they cannot coexist, which breaks the whole blue/green model. A ClusterIP Service
+gives each color its own Pod IP and lets flux flip the Service selector (blue↔green) to
+cut traffic over atomically. It is also the standard, isolatable choice.
+
+**Peer/torrent inbound connectivity** (the reason hostNetwork was historically used) is
+handled WITHOUT hostNetwork:
+
+- gostream's built-in **NAT-PMP** (`config natpmp.*`, `enabled: false` by default) maps
+  the peer/torrent port on the VPN gateway. Any packet-filter / port-map work it performs
+  MUST use the **nft / iptables-nft** backend **only** — never legacy iptables. The image
+  ships Debian bookworm's `iptables`, which is the **nft-backed** `iptables` by default
+  (`iptables-nft`), so gostream's `sudo iptables ...` calls already go through nftables;
+  do not add or depend on `iptables-legacy` tooling. NAT-PMP needs `CAP_NET_ADMIN`, which
+  `privileged: true` already grants.
+- If a **fixed inbound peer port** is ever required without NAT-PMP, add a
+  `hostPort`/NodePort for **just that torrent port** on a single color — do NOT switch the
+  whole pod to `hostNetwork`. (A hostPort still lets the two colors differ on the HTTP
+  ports; only the one torrent port is node-bound, and only one color exposes it.)
+
+**`:8090` exposure note:** the GoStorm engine binds **all interfaces** (not loopback,
+despite the `127.0.0.1` in `gostorm_url` — see `ARTIFACTS.md`). In the live overlay,
+consider a `NetworkPolicy` restricting `:8090` to same-Pod / trusted traffic.
+
+## Resource limits + GOMEMLIMIT
+
+- `requests: cpu 500m / memory 1Gi`, `limits: cpu 2 / memory 3Gi`.
+- `GOMEMLIMIT=2200MiB` is a **soft** heap ceiling set intentionally **below** the 3Gi
+  hard limit: Go GCs aggressively as the heap approaches it, so memory pressure shows up
+  as GC (recoverable) rather than a cgroup OOM-kill, with ~800Mi of headroom left for the
+  cgo/FUSE + torrent **off-heap** buffers (`read_ahead_budget_mb`, metadata cache, libutp,
+  etc.). A plain image `ENV` is a default; this Deployment `env:` overrides it per the
+  `k8s-image` contract. flux may retune per color/host.
+
+## Privileged + securityContext (reference tradeoff, recap)
+
+The Deployment sets `securityContext.privileged: true` on gostream. This is **required,
+not tunable**: kubelet permits `Bidirectional` mountPropagation only for privileged
+containers, and privileged also supplies `/dev/fuse` + `CAP_SYS_ADMIN` (the FUSE mount)
+and `CAP_NET_ADMIN` (NAT-PMP/nft). It is bounded exactly as the FUSE section describes
+(only gostream privileged; jellyfin sidecar unprivileged + RO; tightly scoped hostPath;
+single-tenant node). The non-default way to drop privileged — a `/dev/fuse` device plugin
++ `capabilities.add: [SYS_ADMIN, NET_ADMIN]` — **loses `Bidirectional`** and therefore
+forces the SMB/CSI decoupling (also documented above), so it is not the reference default.
+
+## Validate the capstone
+
+```sh
+# Compose the single-color base (client-side, offline — no cluster needed):
+kubectl kustomize deploy/k8s
+
+# Or validate the raw manifests individually:
+kubectl create --dry-run=client -f deploy/k8s/deployment.yaml -o name   # -> deployment.apps/gostream
+kubectl create --dry-run=client -f deploy/k8s/service.yaml    -o name   # -> service/gostream
+```
+
+**Live in-cluster bring-up is flux's `phantom-library-bluegreen-deploy`** — do NOT claim
+a live deploy from this repo. This task ships the reference spec only; the live check is
+flux's (pod schedules privileged on `spray`, FUSE mounts, `/readyz` goes green, jellyfin
+sees the propagated tree, the Service fronts the live color). Cross-referenced, not
+claimed here.

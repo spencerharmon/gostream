@@ -1,0 +1,60 @@
+# gostream reference Service — the ClusterIP that fronts the three ports
+# (k8s-reference-manifests capstone). Consumed/adapted by flux's
+# `phantom-library-bluegreen-deploy`.
+#
+# NETWORKING DECISION (recorded — see README "Networking: ClusterIP Service, not
+# hostNetwork" and INFRASTRUCTURE.md): the reference uses a ClusterIP Service over
+# pod networking, NOT hostNetwork. Blue/green requires two colors co-resident on one
+# node, which hostNetwork forbids (both would bind the same host ports). This Service
+# selects a SINGLE color; in flux's overlay the live Service's selector is flipped
+# between the blue and green pods to cut traffic over.
+#
+# Inbound peer/torrent connectivity is NOT solved by this ClusterIP (it only fronts
+# in-cluster consumers). It is handled by gostream's built-in NAT-PMP (config
+# `natpmp.*`, disabled by default), whose port-map/firewall work must use the
+# nft/iptables-nft backend ONLY — never legacy iptables. If a fixed inbound peer port
+# is ever needed WITHOUT NAT-PMP, add a hostPort/NodePort for just that torrent port
+# on a single color (documented in README) — do not switch the whole pod to
+# hostNetwork.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gostream
+  namespace: gostream
+  labels:
+    app.kubernetes.io/name: gostream
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/part-of: phantom-library
+  annotations:
+    gostream.dev/reference-only: >-
+      Single-color selector. flux flips this selector between blue/green pods to
+      cut over traffic. Not applied directly from this repo.
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gostream
+    app.kubernetes.io/component: proxy
+    # flux adds a color selector here (e.g. gostream.dev/color: blue) so the live
+    # Service targets exactly one color at a time.
+  ports:
+    # 8080 (proxy): part of the documented port contract but binds NOTHING today
+    # (ARTIFACTS.md) — exposed for contract-completeness; do NOT route real traffic
+    # or build a probe against it expecting a listener.
+    - name: proxy
+      port: 8080
+      targetPort: proxy
+      protocol: TCP
+    # 9080 (metrics): the real HTTP surface — /metrics, /dashboard, /api/*, and the
+    # /healthz + /readyz probe paths. Binds all interfaces (reachable via Pod IP).
+    - name: metrics
+      port: 9080
+      targetPort: metrics
+      protocol: TCP
+    # 8090 (gostorm): embedded GoStorm engine API. Binds ALL interfaces despite its
+    # 127.0.0.1 config value (ARTIFACTS.md) — reachable from anywhere that can reach
+    # the Pod IP. Consider a NetworkPolicy restricting :8090 to same-Pod/trusted
+    # traffic in the live overlay (flux).
+    - name: gostorm
+      port: 8090
+      targetPort: gostorm
+      protocol: TCP
