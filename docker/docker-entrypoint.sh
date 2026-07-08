@@ -9,6 +9,12 @@ STATE_DIR="${GOSTREAM_STATE_DIR:-$ROOT_PATH/STATE}"
 LOG_DIR="${GOSTREAM_LOG_DIR:-$ROOT_PATH/logs}"
 HOST_MOUNT_HINT="${GOSTREAM_HOST_MOUNT_HINT:-}"
 
+# Optional split-config sources (Kubernetes ConfigMap + Secret). When BOTH are
+# set, the two JSON fragments are deep-merged into $CONFIG_PATH below. Unset for
+# single-file installs (Docker/systemd), which use $CONFIG_PATH verbatim.
+CONFIG_TUNING_PATH="${MKV_PROXY_CONFIG_TUNING_PATH:-}"
+CONFIG_SECRET_PATH="${MKV_PROXY_CONFIG_SECRET_PATH:-}"
+
 mkdir -p "$SOURCE_PATH" "$MOUNT_PATH" "$ROOT_PATH" "$STATE_DIR" "$LOG_DIR"
 
 mount_is_readable() {
@@ -46,6 +52,39 @@ if mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
   else
     echo "Non-FUSE mountpoint at $MOUNT_PATH (Docker bind), leaving intact." >&2
   fi
+fi
+
+# Split-config merge (Kubernetes ConfigMap + Secret).
+# When the deployment mounts the non-secret tuning fragment and the secret
+# fragment separately, deep-merge them into a single $CONFIG_PATH so gostream
+# keeps loading exactly one config.json. The merge is recursive (jq '.[0] * .[1]')
+# and the secret fragment wins, so a split object like "plex" (url/library_id in
+# tuning, token in the secret) recombines into one object. No secret VALUES are
+# ever logged. Skipped entirely when the vars are unset.
+if [ -n "$CONFIG_TUNING_PATH" ] || [ -n "$CONFIG_SECRET_PATH" ]; then
+  if [ -z "$CONFIG_TUNING_PATH" ] || [ -z "$CONFIG_SECRET_PATH" ]; then
+    echo "Config merge needs BOTH MKV_PROXY_CONFIG_TUNING_PATH and MKV_PROXY_CONFIG_SECRET_PATH set" >&2
+    exit 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "Config merge requires jq, which is not installed in this image" >&2
+    exit 1
+  fi
+  for merge_src in "$CONFIG_TUNING_PATH" "$CONFIG_SECRET_PATH"; do
+    if [ ! -f "$merge_src" ]; then
+      echo "Config merge source not found: $merge_src" >&2
+      exit 1
+    fi
+  done
+  mkdir -p "$(dirname "$CONFIG_PATH")"
+  merge_tmp="$(mktemp "${CONFIG_PATH}.XXXXXX")"
+  if ! jq -s '.[0] * .[1]' "$CONFIG_TUNING_PATH" "$CONFIG_SECRET_PATH" >"$merge_tmp"; then
+    echo "Config merge failed combining tuning + secret into $CONFIG_PATH" >&2
+    rm -f "$merge_tmp"
+    exit 1
+  fi
+  mv "$merge_tmp" "$CONFIG_PATH"
+  echo "Merged tuning ($CONFIG_TUNING_PATH) + secret into $CONFIG_PATH" >&2
 fi
 
 if [ ! -f "$CONFIG_PATH" ]; then

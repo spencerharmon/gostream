@@ -1,0 +1,67 @@
+# gostream non-secret tuning configuration.
+#
+# This ConfigMap carries ONLY non-secret tuning keys. Every named credential
+# (plex.token, tmdb_api_key, library_api_token) lives in the companion Secret
+# (see secret.sops.example.yaml) and is deep-merged on top of this file at
+# container start, yielding one /etc/gostream/config.json. See README.md.
+#
+# The key set here is derived verbatim from repo/config.json.example minus the
+# secret keys — no keys are invented. `plex` intentionally keeps only its
+# non-secret members (url, library_id); plex.token is added by the Secret via a
+# recursive JSON merge.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gostream-config
+  namespace: gostream
+  labels:
+    app.kubernetes.io/name: gostream
+    app.kubernetes.io/component: config
+data:
+  config.tuning.json: |
+    {
+      "master_concurrency_limit": 25,
+      "read_ahead_budget_mb": 256,
+      "metadata_cache_size_mb": 50,
+      "write_buffer_size_kb": 64,
+      "read_buffer_size_kb": 1024,
+      "fuse_block_size_bytes": 1048576,
+      "streaming_threshold_kb": 128,
+      "log_level": "INFO",
+      "attr_timeout_seconds": 1,
+      "entry_timeout_seconds": 1,
+      "negative_timeout_seconds": 0,
+      "http_client_timeout_seconds": 30,
+      "max_retry_attempts": 6,
+      "retry_delay_ms": 500,
+      "rescue_grace_period_seconds": 240,
+      "rescue_cooldown_hours": 24,
+      "preload_workers_count": 4,
+      "preload_initial_delay_ms": 1000,
+      "warm_start_idle_seconds": 6,
+      "max_concurrent_prefetch": 3,
+      "cache_cleanup_interval_min": 5,
+      "max_cache_entries": 10000,
+      "gostorm_url": "http://127.0.0.1:8090",
+      "proxy_listen_port": 8080,
+      "metrics_port": 9080,
+      "blocklist_url": "https://github.com/Naunter/BT_BlockLists/raw/master/bt_blocklists.gz",
+      "physical_source_path": "/mnt/gostream-mkv-real",
+      "fuse_mount_path": "/mnt/gostream-mkv-virtual",
+      "disk_warmup_quota_gb": 15,
+      "warmup_head_size_mb": 64,
+      "natpmp": {
+        "enabled": false,
+        "gateway": "",
+        "local_port": 8091,
+        "vpn_interface": "wg0",
+        "lifetime": 60,
+        "refresh": 45
+      },
+      "plex": {
+        "url": "http://127.0.0.1:32400",
+        "library_id": 0
+      },
+      "library_add_timeout_sec": 45,
+      "library_validation_lease_minutes": 10
+    }

@@ -22,6 +22,7 @@ RUN apt-get update \
       ffmpeg \
       fuse3 \
       iptables \
+      jq \
       tini \
     && rm -rf /var/lib/apt/lists/*
 
