@@ -1,0 +1,80 @@
+# Reference fragment — task `fuse-mount-propagation` (see ../../docs/tasks/... in the beehive layer,
+# and deploy/k8s/README.md for the full design/tradeoff writeup).
+#
+# Scope: ONLY the shared virtual-mkv volume + the two mountPropagation sides + the gostream
+# securityContext/device that Bidirectional propagation requires. This is a composition INPUT for
+# `k8s-reference-manifests` (the real Deployment: ports, probes, env, resources, state/config mounts)
+# and for jellyfin's `colocation-persistence-contract` (jellyfin's own library/PVC contract) — it is
+# deliberately NOT a deployable, complete Pod. Image references below are placeholders owned by other
+# tasks (gostream image: `k8s-image`; jellyfin image: jellyfin's `container-image`).
+#
+# It is a syntactically valid Pod so it can be structurally sanity-checked offline, e.g.:
+#   kubectl apply --dry-run=client -f deploy/k8s/pod-fuse-fragment.yaml
+#
+# Live in-cluster propagation verification (does a FUSE entry gostream creates actually appear inside
+# the jellyfin container?) is NOT performed here — that is flux's `phantom-library-bluegreen-deploy`.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gostream-fuse-reference
+  annotations:
+    gostream.io/fragment-only: "true"
+spec:
+  # gostream+jellyfin co-located in one Pod is the whole point: mountPropagation: Bidirectional only
+  # replicates a mount to the node and to OTHER Pods that mount the SAME volume — within a single Pod
+  # it is the mechanism that makes the two containers' mount namespaces share the FUSE mount at all.
+  containers:
+    - name: gostream
+      image: gostream:REPLACE_ME # image contract owned by the `k8s-image` task
+      # Bidirectional mount propagation is allowed only in privileged containers (k8s enforces this
+      # at admission — see README.md "The privileged-FUSE tradeoff"). This is a strictly broader grant
+      # than the SYS_ADMIN+/dev/fuse capability set FUSE itself needs outside k8s (see the plain
+      # `docker run --device /dev/fuse --cap-add SYS_ADMIN` path in the repo's top-level README).
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: virtual-mkv
+          mountPath: /mnt/gostream-mkv-virtual # matches fuse_mount_path / GOSTREAM_MOUNT_PATH default
+          mountPropagation: Bidirectional
+        - name: fuse-device
+          mountPath: /dev/fuse
+      # Ports, env (GOMEMLIMIT, MKV_PROXY_CONFIG_PATH, GOSTREAM_ROOT_PATH, ...), probes, resource
+      # requests/limits, and the physical_source_path / state / config mounts are owned by
+      # `k8s-reference-manifests` + `state-pvc` + `config-secret` + `healthz-probe` — intentionally
+      # absent here.
+    - name: jellyfin
+      image: jellyfin:REPLACE_ME # image contract owned by jellyfin's `container-image` task
+      # Deliberately NOT privileged: HostToContainer only ever *receives* propagated mounts, so the
+      # read side of this pairing carries none of the Bidirectional blast radius.
+      securityContext:
+        privileged: false
+        allowPrivilegeEscalation: false
+      volumeMounts:
+        - name: virtual-mkv
+          mountPath: /mnt/gostream-mkv-virtual # same path/volume as gostream; jellyfin library-path
+          mountPropagation: HostToContainer     # mapping onto this is jellyfin's own contract to record
+          readOnly: true
+      # jellyfin's own persistence (/var/lib/jellyfin, /etc/jellyfin PVCs) is
+      # `colocation-persistence-contract`'s deliverable — intentionally absent here.
+  volumes:
+    # DEFAULT: hostPath. One of only two volume backings the Kubernetes project documents as reliable
+    # for mount propagation (the other is a *memory-backed* emptyDir — see the commented-out
+    # alternative below). Also the literal analog of today's host `rshared` bind: same path, so any
+    # on-node tooling that already expects it keeps working, and it is trivially inspectable with a
+    # plain `ls` from the node. Pod co-location already ties gostream+jellyfin to one node, so
+    # hostPath's single-node coupling costs nothing extra here.
+    - name: virtual-mkv
+      hostPath:
+        path: /var/gostream/gostream-mkv-virtual
+        type: DirectoryOrCreate
+    # ALTERNATIVE (not default) — fully Pod-scoped, no stable node path, auto-cleaned on Pod deletion.
+    # Only valid if memory-backed: a plain disk-backed emptyDir is explicitly NOT recommended for mount
+    # propagation by the Kubernetes project (kubernetes/kubernetes#95049). Trade node-path parity with
+    # today's setup for full Pod-scoping; pick this instead of hostPath if that trade is wanted.
+    # - name: virtual-mkv
+    #   emptyDir:
+    #     medium: Memory
+    - name: fuse-device
+      hostPath:
+        path: /dev/fuse
+        type: CharDevice
