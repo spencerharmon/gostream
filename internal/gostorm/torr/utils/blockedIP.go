@@ -51,11 +51,11 @@ func parseBlockList(buf []byte) (iplist.Ranger, error) {
 			ranges = append(ranges, r)
 		}
 	}
-	
+
 	if err := scanner.Err(); err != nil {
 		log.TLogln("Scanner error during blocklist parse:", err)
 	}
-	
+
 	if len(ranges) > 0 {
 		log.TLogln(fmt.Sprintf("Readed ranges: %d (Total lines: %d, Errors: %d)", len(ranges), lineCount, errorCount))
 		return iplist.New(ranges), nil

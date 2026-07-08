@@ -33,18 +33,18 @@ type PrestageProgress struct {
 // prestageState wraps PrestageProgress with a cancel channel for the
 // background reader and the live byte counter.
 type prestageState struct {
-	mu        sync.Mutex
-	progress  PrestageProgress
-	cancel    context.CancelFunc
+	mu       sync.Mutex
+	progress PrestageProgress
+	cancel   context.CancelFunc
 }
 
 // VaultHandler exposes the prestage/unprestage HTTP endpoints.
 type VaultHandler struct {
-	cache        *warmup.DiskWarmupCache
-	cfg          *config.Config
-	progressMu   sync.Mutex
-	progressMap  map[string]*prestageState // keyed by hash
-	logger       *log.Logger
+	cache       *warmup.DiskWarmupCache
+	cfg         *config.Config
+	progressMu  sync.Mutex
+	progressMap map[string]*prestageState // keyed by hash
+	logger      *log.Logger
 }
 
 // NewVaultHandler constructs a handler. cache may be nil if disk warmup is
