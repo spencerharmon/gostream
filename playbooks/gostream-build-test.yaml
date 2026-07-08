@@ -1,4 +1,4 @@
-# gostream-build-test — gofmt(report) / go vet / go build / go test.
+# gostream-build-test — gofmt(gate) / go vet / go build / go test.
 #
 # gostream links FUSE through cgo (github.com/hanwen/go-fuse), so every Go step
 # runs CGO_ENABLED=1; the build node must provide the Go toolchain plus

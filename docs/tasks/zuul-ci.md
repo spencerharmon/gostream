@@ -86,7 +86,7 @@ gostream with no working image-publish path at all. Cutover (removing
 live. The other `.github/workflows/*` files are Gemini bot automation, unrelated
 to build/test CI, and are untouched.
 
-## Verification (local, static — no live Zuul run)
+## Verification (local — no live Zuul run)
 
 - **YAML**: `.zuul.yaml` and both playbooks parse via `python3 yaml.safe_load`;
   structural checks confirm every `project:` check/gate job maps to a defined
@@ -100,15 +100,31 @@ to build/test CI, and are untouched.
   failure — `internal/ai/tuner.go` used an unescaped `%` in a `fmt.Sprintf`
   format string (`(target <60%)`), which vet reads as an unknown verb `)`. Fixed
   to `%%` (correct literal-percent escaping); `go vet ./...` is now clean.
-- **Build commands**: identical to `docker/Dockerfile` / README "Build from
-  Source", which already produce released images — so they are proven-correct.
-  A local `CGO_ENABLED=1 go build` compiles all gostream + cgo sources and
-  reaches the final link stage; in this sandbox the native link fails only on a
-  pre-existing broken-toolchain issue (`ld: cannot find -latomic_asneeded`, the
-  identical breakage beehive's `release-verify` recorded, plus GCC 16 being far
-  newer than the Dockerfile's pinned `golang:1.24-bookworm` gcc-12, which trips a
-  third-party cgo dep's legacy C). The pinned bookworm toolchain in
-  `docker/Dockerfile` builds and links cleanly, as the published images show.
+- **go test**: the job runs `go test -count=1 ./...`. The tree had one
+  pre-existing test failure independent of this task — `torrstor`'s
+  `TestCacheCleanPiecesNoDeadlock` builds a `Cache{}` struct literal directly
+  (bypassing `NewCache`/`Init`) with `pieceCount: 200`, but never allocated the
+  `pieceInRange` bitmap that `Init()` sizes to `pieceCount`. The V305 eviction
+  optimization that added that bitmap to `Init()` + `getRemPieces()` did not
+  update this older struct-literal test, so `getRemPieces()` panicked with
+  `index out of range … with length 0` on the unallocated slice. Fixed by
+  allocating `pieceInRange: make([]bool, pieceCount)` in the test — matching the
+  invariant production's `Init()` guarantees; no production code changed, and the
+  test still fully exercises the concurrent `cleanPieces()` scenario. The full
+  suite (`torrstor`, `library`, `monitor/dashboard`, `syncer/engines`, `warmup`)
+  now passes.
+- **Build & test commands**: the Go steps mirror `docker/Dockerfile` / README
+  "Build from Source" (already producing released images). Locally, with
+  `CGO_ENABLED=1`, `go vet ./...`, `go build ./...`, and `go test -count=1 ./...`
+  all pass green. The sandbox host ships a mis-packaged libatomic — its gcc spec
+  references a `libatomic_asneeded` the system lacks (`ld: cannot find
+  -latomic_asneeded`, the identical breakage beehive's `release-verify` recorded)
+  — and GCC 16 is far newer than the Dockerfile's pinned `golang:1.24-bookworm`
+  gcc-12, tripping a third-party cgo dep's legacy C. Both are worked around
+  locally with `CGO_CFLAGS="-std=gnu11 -Wno-error"` and a faithful
+  `libatomic_asneeded → libatomic` link shim (verification-only; nothing in the
+  repo depends on it). The pinned bookworm toolchain in `docker/Dockerfile` builds
+  and links cleanly with no shims, as the published images show.
 - **Live pipeline run, image push, and signing/publishing** are correctly OUT of
   scope here — they run on the deployed Zuul / by the operator once flux's
   Nodepool provides an executor node.
