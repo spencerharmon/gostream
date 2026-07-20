@@ -1,0 +1,43 @@
+# gostream persistent state — the STATE contract for the k3s (spray) deployment.
+#
+# Mounted at /usr/local/state (env GOSTREAM_ROOT_PATH). Holds:
+#   - gostream.db  (SQLite) — the PERMANENT inode map: every virtual .mkv gets a
+#                   stable inode/ID across restarts AND redeploys. If this is lost,
+#                   Jellyfin item IDs churn and the library breaks. It is SACRED.
+#   - sync state / negative caches / scheduler state / logs/.
+#
+# Blue/green: SHARED — one claim, used read-write by BOTH the blue and the green
+# gostream pods (see deploy/k8s/README.md for the decision + tradeoff). This keeps
+# the inode map byte-identical across a color flip so item IDs never churn.
+#
+# The reference Pod that binds this claim is owned by k8s-reference-manifests;
+# this manifest only delivers the claim + the persistence contract.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gostream-state
+  labels:
+    app.kubernetes.io/name: gostream
+    app.kubernetes.io/component: state
+    app.kubernetes.io/part-of: phantom-library
+    # Flux garbage-collection opt-out. A redeploy or removal of the Kustomization
+    # must NEVER prune this claim — pruning would delete the volume and wipe the
+    # sacred gostream.db inode map. Keep the state; never rotate it on deploy.
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  # ReadWriteOnce (NOT ReadWriteOncePod): RWO binds the volume to a single NODE,
+  # which lets multiple pods co-located on that node mount it — exactly what the
+  # shared blue/green model needs on the single-node cluster (spray).
+  # ReadWriteOncePod would forbid the second color from mounting and break sharing.
+  accessModes:
+    - ReadWriteOnce
+  # k3s built-in provisioner on spray. Override in the flux overlay for a
+  # different class. local-path defaults to a Delete reclaim policy, so back this
+  # with a Retain PV / backups if you want deletes to survive too (the
+  # prune-disabled label already stops flux from ever deleting the claim).
+  storageClassName: local-path
+  resources:
+    requests:
+      # Reference default: the SQLite db + caches are small but grow with library
+      # size. Tune per library in the flux overlay.
+      storage: 5Gi
