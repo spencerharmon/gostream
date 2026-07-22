@@ -102,3 +102,5 @@ config-updating (`.zuul.yaml`) ref-updated over the `github` connection raises
 `TypeError: expected string or bytes-like object, got 'NoneType'` in
 `scheduler._forward_trigger_event -> tpc.includesBranch(None)` and the event is dropped
 (no build). A NON-config push avoids the tenant-reconfigure path and forwards normally.
+
+Clean-delta trigger (2026-07-22T20:11:45Z): previous push reverted .zuul.yaml so this docs-only commit produces a delta with NO config file, forwarding normally to enqueue gostream-image-build.
