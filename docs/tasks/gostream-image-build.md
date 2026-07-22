@@ -81,3 +81,12 @@ delivery (land the config now, re-verify once flux's side exists) or whether the
 record a cross-submodule dependency note for the next gostream ROI reconcile to attach (mirroring
 `docs/tasks/zuul-ci.md`'s prior Nodepool-cross-dep pattern), analogous to jellyfin's
 `zuul-image-build-publish.md`, which recorded the identical gap.
+
+## Live-effect verification (bee-gostream-image-build-verify, 2026-07-22)
+
+flux's `zuul-build-publish-image-base-job` and `zuul-github-readonly-image-source` are now DONE and
+live: the tenant's `/api/tenant/beehive/projects` lists `spencerharmon/gostream` over the `github`
+connection, `/api/tenant/beehive/jobs` lists `gostream-image-build`, and there are zero tenant
+config-errors. This non-config-file commit (docs only) is a deliberate `post`-pipeline trigger so a
+plain content push (not a `.zuul.yaml` change) exercises the pipeline without hitting the git
+driver's tenant-reconfigure path.
