@@ -34,7 +34,9 @@
 # verified 2026-07-22 (bee-gostream-image-build-verify): the tenant's
 # `/api/tenant/beehive/projects` now lists `spencerharmon/gostream` over the
 # `github` connection and `/api/tenant/beehive/jobs` lists `gostream-image-build`
-# with zero tenant config-errors.
+# with zero tenant config-errors. This push (bee-gostream-image-build-verify,
+# 2026-07-22) also serves as the `post`-pipeline trigger to confirm a real
+# `gostream-image-build` run publishes and is pullable by digest.
 #
 # `nodeset:` is deliberately OMITTED on the two node-needing non-publish jobs
 # (each inherits whatever nodeset the tenant's base job defines); the publish
