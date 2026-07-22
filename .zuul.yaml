@@ -25,11 +25,16 @@
 #     `build-and-publish-image` base job and needs the `buildah-pod` Nodepool
 #     node that base job's nodeset requests.
 # Per ROI (reconciled 332606ef, 2026-07-20) the Nodepool build-node provider
-# NOW EXISTS, so these jobs are no longer honestly-gated on its absence — but
-# see docs/tasks/gostream-image-build.md for a DIFFERENT, still-open
-# prerequisite gap this task found (the `build-and-publish-image` base job +
-# `spencerharmon/gostream` untrusted-project registration are not yet present
-# in flux's tracked tenant-config.yaml as of flux commit b0690dd).
+# NOW EXISTS, so these jobs are no longer honestly-gated on its absence. The
+# earlier gap noted here (the `build-and-publish-image` base job + the
+# `spencerharmon/gostream` untrusted-project registration missing from flux's
+# tracked tenant-config.yaml as of flux commit b0690dd) is RESOLVED as of flux
+# commit cf78040 (base job + gitea_registry_push secret) and 33df689 (the
+# read-only credential-less github git connection registering this project) —
+# verified 2026-07-22 (bee-gostream-image-build-verify): the tenant's
+# `/api/tenant/beehive/projects` now lists `spencerharmon/gostream` over the
+# `github` connection and `/api/tenant/beehive/jobs` lists `gostream-image-build`
+# with zero tenant config-errors.
 #
 # `nodeset:` is deliberately OMITTED on the two node-needing non-publish jobs
 # (each inherits whatever nodeset the tenant's base job defines); the publish
