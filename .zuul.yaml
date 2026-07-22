@@ -42,6 +42,15 @@
 # (each inherits whatever nodeset the tenant's base job defines); the publish
 # job inherits its nodeset (`buildah-pod`) from its `build-and-publish-image`
 # parent.
+#
+# LIVE-EFFECT TRIGGER (bee-gostream-image-build-verify, 2026-07-22): confirmed via
+# `/api/tenant/beehive/projects` that spencerharmon/gostream now loads over the `github`
+# connection with zero `/api/tenant/beehive/config-errors`, and `/api/tenant/beehive/jobs`
+# lists `gostream-image-build`. No `post` build had fired yet for this project (the git
+# driver's `poll_delay=60` only emits `ref-updated` for refs that change AFTER a poll
+# baseline is established, so commits that predate the connection's first poll are
+# invisible) — this comment-only push is the real ref-update needed to fire the first
+# `post` run and let the `gostream-image-build` job publish+confirm the image by digest.
 
 - job:
     name: gostream-build-test
