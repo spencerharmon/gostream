@@ -93,3 +93,12 @@ driver's tenant-reconfigure path.
 
 Retry after full zuul-scheduler restart (2026-07-22, second attempt) to confirm the `post` pipeline's
 github trigger filter is active post-reload.
+
+Retry 2026-07-22 (session gostream-1784750402-44655): docs-only push AFTER the current
+zuul-scheduler baseline, to enqueue a real `post` gostream-image-build and confirm the
+published image is pullable by digest from the Gitea OCI registry. Root cause of the earlier
+no-build passes is now pinned: the Zuul git driver never sets `event.branch`, so a
+config-updating (`.zuul.yaml`) ref-updated over the `github` connection raises
+`TypeError: expected string or bytes-like object, got 'NoneType'` in
+`scheduler._forward_trigger_event -> tpc.includesBranch(None)` and the event is dropped
+(no build). A NON-config push avoids the tenant-reconfigure path and forwards normally.
