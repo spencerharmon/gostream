@@ -90,3 +90,6 @@ connection, `/api/tenant/beehive/jobs` lists `gostream-image-build`, and there a
 config-errors. This non-config-file commit (docs only) is a deliberate `post`-pipeline trigger so a
 plain content push (not a `.zuul.yaml` change) exercises the pipeline without hitting the git
 driver's tenant-reconfigure path.
+
+Retry after full zuul-scheduler restart (2026-07-22, second attempt) to confirm the `post` pipeline's
+github trigger filter is active post-reload.
