@@ -36,7 +36,11 @@
 # `github` connection and `/api/tenant/beehive/jobs` lists `gostream-image-build`
 # with zero tenant config-errors. This push (bee-gostream-image-build-verify,
 # 2026-07-22) also serves as the `post`-pipeline trigger to confirm a real
-# `gostream-image-build` run publishes and is pullable by digest.
+# `gostream-image-build` run publishes and is pullable by digest: the tenant's
+# `post` pipeline fires `ref-updated` on `^refs/heads/.*$` over the `github`
+# connection (flux tenant-config.yaml), so this branch push itself enqueues a
+# real gostream-image-build and publishes git.spencerharmon.com/zuul/gostream:<sha>
+# to the Gitea OCI registry — the live-effect confirmation this task records.
 #
 # `nodeset:` is deliberately OMITTED on the two node-needing non-publish jobs
 # (each inherits whatever nodeset the tenant's base job defines); the publish
