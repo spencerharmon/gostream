@@ -123,7 +123,15 @@
         - gostream-image-build-check
         - gostream-image-build
 
-# LIVE-EFFECT TRIGGER (bee-gostream-image-build-verify, 2026-07-23 02:07 UTC): comment-only
-# push to re-fire the `post` pipeline against a freshly-restarted zuul-executor
-# (executor pod age confirmed <10min old at trigger time), so the prior FAILURE at build
-# _id 21 (10s runtime, executed before this restart) gets a clean re-attempt.
+# LIVE-EFFECT TRIGGER (bee-gostream-image-build-verify, 2026-07-23 02:3x UTC): comment-only
+# push to re-fire the `post` pipeline. ROOT CAUSE of the prior failures now resolved:
+# build _id 25 (02:07) FAILED at `buildah bud` with "No such file or directory:
+# src/github.com/spencerharmon/gostream" because the base job's workspace-sync PRE-RUN
+# (flux zuul-build-node-workspace-sync) was NOT yet in the live tenant config — the gitea
+# config-project spencerharmon/zuul-config only gained it at commit 81e3860 ("jobs: add
+# workspace-sync pre-run to build-and-publish-image"), which the scheduler loaded at
+# 02:21:45 (AFTER build 25). The live base job now runs
+# `pre-run: playbooks/workspace-sync-build-and-publish-image.yaml`, which rsyncs the
+# executor's merged checkout onto the buildah node at {{ zuul.project.src_dir }} so
+# `buildah bud --chdir` finds the context. This push is the fresh ref-update that re-fires
+# the `post` run so `gostream-image-build` can build + push and publish the image by digest.
