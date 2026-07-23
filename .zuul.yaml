@@ -122,3 +122,8 @@
         - gostream-build-test
         - gostream-image-build-check
         - gostream-image-build
+
+# LIVE-EFFECT TRIGGER (bee-gostream-image-build-verify, 2026-07-23 02:07 UTC): comment-only
+# push to re-fire the `post` pipeline against a freshly-restarted zuul-executor
+# (executor pod age confirmed <10min old at trigger time), so the prior FAILURE at build
+# _id 21 (10s runtime, executed before this restart) gets a clean re-attempt.
