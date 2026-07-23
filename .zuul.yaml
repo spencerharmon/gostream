@@ -53,6 +53,11 @@
 # scripts/provision-zuul-registry-push-secret.sh, which materializes `username`/`password`
 # from the beehive store keys `zuul_registry_push_user`/`zuul_registry_push_token` into
 # Secret zuul/gitea-registry-push; the executor mount then populated the credential files.
+# The zuul-executor runs base-job playbooks in a bubblewrap jail whose /etc/zuul
+# bind-mount was established at pod start (before the Secret existed), so it kept
+# reading an empty mount even after provisioning; a `kubectl -n zuul rollout restart
+# deploy/zuul-executor` was required for the executor to re-bind the now-populated
+# credential (verified: /etc/zuul/registry-push/username readable in the fresh pod).
 # This comment-only push is the fresh ref-update that re-fires the `post` run so
 # `gostream-image-build` can now `buildah login` + push and publish the image by digest.
 
