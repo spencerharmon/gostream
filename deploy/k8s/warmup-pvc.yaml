@@ -5,20 +5,24 @@
 # therefore WIPE-SAFE and deliberately does NOT carry the prune-disabled guard the
 # state claim has: losing this cache costs a re-warm, never library integrity.
 #
-# Deploy only if a fast SSD warm cache is wanted. Shared read-write across blue and
-# green (same node, same RWO rules as the state claim). The reference Pod that
-# binds it is owned by k8s-reference-manifests.
+# Deploy only if a fast SSD warm cache is wanted. PER-COLOR, like the state claims
+# (state-config-pvc-per-color): each color binds its OWN warmup claim
+# (`gostream-warmup-<color>`) so no two pods write the cache concurrently. Losing
+# this cache costs a re-warm, never library integrity. The reference Pod that binds
+# it is owned by k8s-reference-manifests.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: gostream-warmup
+  name: gostream-warmup-blue
   labels:
     app.kubernetes.io/name: gostream
     app.kubernetes.io/component: warmup-cache
     app.kubernetes.io/part-of: phantom-library
+    gostream.dev/color: blue
 spec:
-  # RWO, single node (spray) — same shared-across-colors rationale as the state
-  # claim. NOT ReadWriteOncePod, so both colors can mount it on the node.
+  # RWO, single node (spray) — bound by only this color's pod. NOT ReadWriteOncePod
+  # in case the pod is briefly recreated on the same node; never co-mounted by the
+  # other color.
   accessModes:
     - ReadWriteOnce
   # Point at an SSD-backed StorageClass if one exists on spray; falls back to the
@@ -27,4 +31,21 @@ spec:
   resources:
     requests:
       # Reference default for a warm cache; size to the working set. Reconstructible.
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gostream-warmup-green
+  labels:
+    app.kubernetes.io/name: gostream
+    app.kubernetes.io/component: warmup-cache
+    app.kubernetes.io/part-of: phantom-library
+    gostream.dev/color: green
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
       storage: 50Gi

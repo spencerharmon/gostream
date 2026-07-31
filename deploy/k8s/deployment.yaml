@@ -11,9 +11,11 @@
 #   - FUSE mount propagation (fuse-mount-propagation) — the shared `virtual-mkv`
 #     volume + gostream's Bidirectional/privileged mount, ready for flux to drop in
 #     the jellyfin `HostToContainer` RO sidecar. See pod-fuse-fragment.yaml.
-#   - State persistence (state-pvc) — binds the `gostream-state` PVC at
-#     /usr/local/state (GOSTREAM_ROOT_PATH); the sacred gostream.db inode map is
-#     never wiped. The PVC object itself ships from state-pvc.yaml (that task).
+#   - State persistence (state-config-pvc-per-color) — binds a PER-COLOR
+#     `gostream-state-<color>` PVC at /usr/local/state (GOSTREAM_ROOT_PATH); the
+#     sacred gostream.db inode map (and config.db) is never wiped. The PVC objects
+#     ship from state-pvc.yaml. This single-color reference binds `gostream-state-blue`
+#     as its example; flux patches claimName to the running color per overlay.
 #   - Split config (config-secret) — ConfigMap `gostream-config` + Secret
 #     `gostream-config-secret` deep-merged by the entrypoint into one
 #     /etc/gostream/config.json (MKV_PROXY_CONFIG_PATH).
@@ -40,9 +42,12 @@ spec:
   # flux's Service flipping between them; that is flux's overlay, not this reference.
   replicas: 1
   # Recreate, NOT RollingUpdate: one color must not double-bind the FUSE hostPath
-  # (Bidirectional propagation) or the RWO state PVC with itself during a redeploy —
-  # tear the old pod down before starting the new one. Cross-COLOR overlap (blue up
-  # while green drains) is flux's cutover sequencing concern, handled in its overlay.
+  # (Bidirectional propagation) or its RWO state PVC with itself during a redeploy —
+  # tear the old pod down before starting the new one. Each color owns its OWN
+  # `gostream-state-<color>` claim, so there is never cross-color contention on one
+  # volume; cross-COLOR cutover sequencing (blue up while green drains) plus the
+  # state sync between the two claims is flux's concern, handled in its overlay
+  # (scripts/phantom-library-bluegreen-flip.sh).
   strategy:
     type: Recreate
   selector:
@@ -65,9 +70,10 @@ spec:
       # (config `natpmp.*`, disabled by default) whose firewall/port-map work is
       # nft/iptables-nft ONLY (never legacy iptables) — see README.
       #
-      # Both colors must land on the one node that owns the FUSE hostPath + RWO state
-      # PVC. flux pins that in its overlay (nodeSelector/affinity for `spray`); it is
-      # left out of this reference so it carries no site-specific node name.
+      # Both colors must land on the one node that owns the FUSE hostPath + per-color
+      # RWO state PVCs. flux pins that in its overlay (nodeSelector/affinity for
+      # `spray`); it is left out of this reference so it carries no site-specific node
+      # name.
       terminationGracePeriodSeconds: 60 # let gostream save the inode map + unmount FUSE
       containers:
         - name: gostream
@@ -96,9 +102,9 @@ spec:
               value: /config-src/tuning/config.tuning.json # from ConfigMap gostream-config
             - name: MKV_PROXY_CONFIG_SECRET_PATH
               value: /config-src/secret/config.secret.json # from Secret gostream-config-secret
-            # --- State (state-pvc): root path == the PVC mountPath, so gostream.db
-            #     (GetStateDir() = $GOSTREAM_ROOT_PATH/STATE) lands on persistent
-            #     storage. Never wiped. ---
+            # --- State (state-config-pvc-per-color): root path == the PVC mountPath,
+            #     so gostream.db (GetStateDir() = $GOSTREAM_ROOT_PATH/STATE) and
+            #     config.db land on this color's OWN persistent claim. Never wiped. ---
             - name: GOSTREAM_ROOT_PATH
               value: /usr/local/state
             # --- FUSE paths (fuse-mount-propagation): MOUNT_PATH is the propagating
@@ -156,8 +162,9 @@ spec:
             # from the sacred inode map, so an emptyDir is acceptable for the reference.
             - name: real-mkv
               mountPath: /mnt/gostream-mkv-real # == GOSTREAM_SOURCE_PATH / config physical_source_path
-            # Persistent state (state-pvc): gostream.db inode map + sync/scheduler state
-            # + logs. Bound at GOSTREAM_ROOT_PATH. NEVER wiped/re-inited.
+            # Persistent state (state-config-pvc-per-color): gostream.db inode map +
+            # config.db + sync/scheduler state + logs. Bound at GOSTREAM_ROOT_PATH.
+            # NEVER wiped/re-inited.
             - name: state
               mountPath: /usr/local/state
             # Merged config output (writable emptyDir the entrypoint writes the merged
@@ -188,15 +195,21 @@ spec:
         # promote this to a PVC if it wants to avoid stub-rebuild churn across restarts.
         - name: real-mkv
           emptyDir: {}
-        # Sacred persistent state. Claim shipped by state-pvc.yaml (state-pvc task);
-        # both blue/green colors reference this SAME claim so the inode map is
-        # byte-identical across a color flip (Jellyfin item IDs never churn). RWO (not
-        # RWOncePod) so both colors can co-mount it on the one node.
+        # Sacred persistent state. Claims shipped by state-pvc.yaml
+        # (state-config-pvc-per-color task). Each color references its OWN
+        # `gostream-state-<color>` claim — NOT a shared claim — so no two writers ever
+        # touch gostream.db / config.db concurrently (the corruption the shared model
+        # caused). State is carried across a color flip by the flip pipeline's sync
+        # step (active -> idle), not by a shared volume; see
+        # scripts/phantom-library-bluegreen-flip.sh. This single-color reference binds
+        # the blue claim as its example; flux patches claimName per color. RWO, single
+        # node (spray).
         - name: state
           persistentVolumeClaim:
-            claimName: gostream-state
-        # Optional SSD warm cache (state-pvc's gostream-warmup) can be added by flux as
-        # an extra volume mounted at /usr/local/state/warmup — reconstructible, wipe-safe.
+            claimName: gostream-state-blue
+        # Optional SSD warm cache (state-config-pvc-per-color's per-color
+        # gostream-warmup-<color>) can be added by flux as an extra volume mounted at
+        # /usr/local/state/warmup — reconstructible, wipe-safe.
         - name: config-merged
           emptyDir: {}
         - name: config-tuning

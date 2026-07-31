@@ -1,34 +1,57 @@
 # gostream persistent state — the STATE contract for the k3s (spray) deployment.
 #
-# Mounted at /usr/local/state (env GOSTREAM_ROOT_PATH). Holds:
-#   - gostream.db  (SQLite) — the PERMANENT inode map: every virtual .mkv gets a
-#                   stable inode/ID across restarts AND redeploys. If this is lost,
+# Mounted at /usr/local/state (env GOSTREAM_ROOT_PATH). Holds the two on-disk
+# databases plus reconstructible caches/logs:
+#   - STATE/gostream.db  (SQLite) — the PERMANENT inode map: every virtual .mkv gets
+#                   a stable inode/ID across restarts AND redeploys. If this is lost,
 #                   Jellyfin item IDs churn and the library breaks. It is SACRED.
+#   - config.db  (BoltDB) — the gostorm settings + torrents registry
+#                   (internal/gostorm/settings writes it under the state root).
 #   - sync state / negative caches / scheduler state / logs/.
 #
-# Blue/green: SHARED — one claim, used read-write by BOTH the blue and the green
-# gostream pods (see deploy/k8s/README.md for the decision + tradeoff). This keeps
-# the inode map byte-identical across a color flip so item IDs never churn.
+# Blue/green: PER-COLOR — one claim PER color (`gostream-state-blue`,
+# `gostream-state-green`), each mounted read-write by ONLY that color's gostream pod.
+# This SUPERSEDES the earlier "recommend a shared state PVC" call recorded by the
+# DONE `state-pvc` task. The operator decided AGAINST a shared claim: a single
+# BoltDB/SQLite file (config.db / gostream.db) written CONCURRENTLY by both the blue
+# and the green gostream pods during a cutover overlap corrupted the file. Each color
+# writing its OWN databases removes that concurrent-writer hazard entirely.
 #
-# The reference Pod that binds this claim is owned by k8s-reference-manifests;
-# this manifest only delivers the claim + the persistence contract.
+# Cutover carries state forward WITHOUT a shared volume: flux's blue/green flip
+# pipeline runs a SYNC STEP (active color -> idle color) that copies the state
+# databases from the currently-active color's claim into the idle color's claim
+# before the idle color is promoted — see scripts/phantom-library-bluegreen-flip.sh
+# (cross-referenced by NAME ONLY; its sync logic is owned + verified flux-side, NOT
+# here). Because the sync copies the sacred gostream.db forward verbatim, inode-map
+# stability across a color flip is preserved just as the shared model intended —
+# without ever letting two writers touch one file.
+#
+# Inode-map stability is SACRED: neither claim below, nor any consumer of it, may
+# wipe, rotate, or re-init gostream.db on redeploy or on a color flip. The
+# prune-disabled guard on each claim enforces that at the GitOps layer.
+#
+# The reference Pod that binds a claim is owned by k8s-reference-manifests; this
+# manifest only delivers the per-color claims + the persistence contract. Both claims
+# are shipped so flux's overlay binds each color to its own; the single-color
+# reference Deployment binds `gostream-state-blue` as its example (see deployment.yaml).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: gostream-state
+  name: gostream-state-blue
   labels:
     app.kubernetes.io/name: gostream
     app.kubernetes.io/component: state
     app.kubernetes.io/part-of: phantom-library
+    gostream.dev/color: blue
     # Flux garbage-collection opt-out. A redeploy or removal of the Kustomization
     # must NEVER prune this claim — pruning would delete the volume and wipe the
     # sacred gostream.db inode map. Keep the state; never rotate it on deploy.
     kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
-  # ReadWriteOnce (NOT ReadWriteOncePod): RWO binds the volume to a single NODE,
-  # which lets multiple pods co-located on that node mount it — exactly what the
-  # shared blue/green model needs on the single-node cluster (spray).
-  # ReadWriteOncePod would forbid the second color from mounting and break sharing.
+  # ReadWriteOnce: the claim is bound read-write by exactly ONE color's pod. Unlike
+  # the superseded shared model, NO second pod co-mounts it, so there is never a
+  # concurrent writer to gostream.db / config.db. (RWO also keeps the volume on the
+  # single node `spray`, where both colors are pinned.)
   accessModes:
     - ReadWriteOnce
   # k3s built-in provisioner on spray. Override in the flux overlay for a
@@ -38,6 +61,27 @@ spec:
   storageClassName: local-path
   resources:
     requests:
-      # Reference default: the SQLite db + caches are small but grow with library
-      # size. Tune per library in the flux overlay.
+      # Reference default: the SQLite + BoltDB files + caches are small but grow with
+      # library size. Tune per library in the flux overlay.
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gostream-state-green
+  labels:
+    app.kubernetes.io/name: gostream
+    app.kubernetes.io/component: state
+    app.kubernetes.io/part-of: phantom-library
+    gostream.dev/color: green
+    # Same sacred-state prune guard as the blue claim — never pruned, never wiped.
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  # ReadWriteOnce, bound by ONLY the green pod. Mirror of the blue claim; the flip
+  # pipeline's sync step keeps gostream.db in step between the two.
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
       storage: 5Gi

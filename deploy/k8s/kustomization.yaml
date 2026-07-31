@@ -12,9 +12,11 @@
 # DELIBERATELY EXCLUDED (owned elsewhere / overlaid by flux) — do not add here:
 #   - secret.sops.example.yaml — schema/example ONLY; the REAL Secret is SOPS-encrypted
 #     in flux's tree. flux supplies `gostream-config-secret` in its overlay.
-#   - state-pvc.yaml / warmup-pvc.yaml — shipped by the state-pvc task; the Deployment
-#     references the `gostream-state` claim by name. flux includes the PVC(s) in its
-#     overlay so the same claim is shared across blue+green.
+#   - state-pvc.yaml / warmup-pvc.yaml — shipped by the state-config-pvc-per-color
+#     task; the Deployment references a PER-COLOR `gostream-state-<color>` claim by
+#     name. flux includes both per-color PVCs in its overlay (each color binds its
+#     OWN claim; state is carried across a flip by the sync step in
+#     scripts/phantom-library-bluegreen-flip.sh, NOT a shared volume).
 #   - pod-fuse-fragment.yaml — a reference-ONLY two-container Pod illustrating the FUSE
 #     propagation pairing; never applied.
 #   - the jellyfin sidecar + blue/green color patches — flux's job (added as a second

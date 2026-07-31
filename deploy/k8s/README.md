@@ -12,9 +12,12 @@ blue/green overlay. Pieces:
   hostNetwork".
 - **Split config** — `configmap.yaml` + `secret.sops.example.yaml`, merged to one
   `/etc/gostream/config.json` at start (below).
-- **State persistence** — the `gostream-state` PVC (shipped by the `state-pvc` task's
-  `state-pvc.yaml`), bound at `/usr/local/state`; the sacred `gostream.db` inode map is
-  never wiped.
+- **State persistence** — a PER-COLOR `gostream-state-<color>` PVC (shipped by the
+  `state-config-pvc-per-color` task's `state-pvc.yaml`), bound at `/usr/local/state`;
+  the sacred `gostream.db` inode map and `config.db` are never wiped. Each color owns
+  its own claim (no shared file, no concurrent-writer corruption); the flip pipeline
+  syncs state active→idle across a cutover — see
+  `scripts/phantom-library-bluegreen-flip.sh`.
 - **Health probes** — `/healthz` (liveness) + `/readyz` (readiness) on `:9080` (the
   `healthz-probe` task), wired into the Deployment.
 - **FUSE mount propagation** — `pod-fuse-fragment.yaml`, how gostream's in-container
@@ -273,7 +276,7 @@ jellyfin sidecar, and the real SOPS Secret on top.
 | Dep task | Contributes | Where in the Deployment |
 |----------|-------------|-------------------------|
 | **fuse-mount-propagation** | shared `virtual-mkv` hostPath + gostream's `Bidirectional`/`privileged` FUSE mount; the seam for flux's jellyfin `HostToContainer` RO sidecar | `virtual-mkv` volume + mount at `/mnt/gostream-mkv-virtual` |
-| **state-pvc** | `gostream-state` PVC bound at `/usr/local/state` (`GOSTREAM_ROOT_PATH`); `gostream.db` inode map never wiped | `state` volume (`claimName: gostream-state`) |
+| **state-config-pvc-per-color** | PER-COLOR `gostream-state-<color>` PVC bound at `/usr/local/state` (`GOSTREAM_ROOT_PATH`); `gostream.db` inode map + `config.db` never wiped; state carried across a flip by the sync step in `scripts/phantom-library-bluegreen-flip.sh`, not a shared volume | `state` volume (`claimName: gostream-state-blue` in this single-color reference; flux patches per color) |
 | **config-secret** | ConfigMap `gostream-config` + Secret `gostream-config-secret`, deep-merged by the entrypoint into one `/etc/gostream/config.json` | `config-tuning`/`config-secret` (RO sources) + `config-merged` emptyDir |
 | **healthz-probe** | `/healthz` (liveness) + `/readyz` (readiness) on `:9080`, no external-upstream flapping | `livenessProbe`/`readinessProbe` |
 | **k8s-image** (sibling) | the tuned `docker.io/mrrobotogit/gostream:testing` image + port/GOMEMLIMIT/fail-loud contract (`ARTIFACTS.md`) | container `image`, ports, `GOMEMLIMIT` |
@@ -302,13 +305,38 @@ the PVC mount, FUSE paths, and merged config all agree:
   `HostToContainer` RO at its own path to receive gostream's FUSE mount by propagation
   (illustrated end-to-end in `pod-fuse-fragment.yaml`).
 - The **blue/green color overlay** — per-color name/label patches + a second replica set;
-  both colors reference the SAME `gostream-state` claim so the inode map is byte-identical
-  across a flip.
+  each color references its OWN `gostream-state-<color>` claim (no shared file), and the
+  flip pipeline's sync step (active→idle) carries `gostream.db`/`config.db` forward so the
+  inode map stays consistent across a flip without a shared volume — see
+  `scripts/phantom-library-bluegreen-flip.sh`.
 - The **real Secret** — `gostream-config-secret`, SOPS-encrypted in flux's tree
   (`secret.sops.example.yaml` here is schema-only).
 - The `spray` **nodeSelector/affinity** — both colors must co-locate on the one node that
-  owns the FUSE hostPath + RWO state PVC (left out here so the reference carries no
-  site-specific node name).
+  owns the FUSE hostPath + the per-color RWO state PVCs (left out here so the reference
+  carries no site-specific node name).
+
+## State PVC: per-color, not shared (decision recorded)
+
+**Decision: one `gostream-state-<color>` PVC PER color; NOT a single shared claim.**
+This SUPERSEDES the earlier "recommend a shared state PVC" call from the DONE
+`state-pvc` task. The operator decided against sharing after a shared BoltDB/SQLite
+file (`config.db` / `STATE/gostream.db`) written **concurrently** by both the blue and
+green gostream pods — which overlap during a cutover — corrupted the file.
+
+Each color mounts only its OWN claim (`gostream-state-blue` / `gostream-state-green`,
+both `ReadWriteOnce`, shipped by `state-pvc.yaml`), so there is never a concurrent
+writer to either database. The volume still holds the same contract: `STATE/gostream.db`
+(the SACRED inode map) and `config.db` (gostorm settings + torrents registry), never
+wiped or rotated on redeploy/flip (`kustomize.toolkit.fluxcd.io/prune: disabled`).
+
+**Carrying state across a flip:** because the colors no longer share a volume, the
+blue/green flip pipeline `scripts/phantom-library-bluegreen-flip.sh` runs a **sync step
+(active → idle)** that copies the state databases from the currently-active color's
+claim into the idle color's claim before promoting it — preserving inode-map stability
+across the flip exactly as the shared model intended, without ever letting two writers
+touch one file. That script's sync logic is owned and verified flux-side; it is
+cross-referenced here **by name only** and neither implemented nor verified in this
+reference.
 
 ## Networking: ClusterIP Service, not hostNetwork (decision recorded)
 
