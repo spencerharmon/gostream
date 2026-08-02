@@ -168,12 +168,28 @@ func safeMigrate(source, target GoStormDB, xpath, name, targetName string, clear
 func setupDatabaseRouting(bboltDB, jsonDB GoStormDB, settingsInJson bool) {
 	dbRouter := NewXPathDBRouter()
 
+	settingsDB := bboltDB
 	if settingsInJson {
-		dbRouter.RegisterRoute(jsonDB, "Settings")
-	} else {
-		dbRouter.RegisterRoute(bboltDB, "Settings")
+		settingsDB = jsonDB
 	}
 
+	// Opt-in externalization of the config.db "Settings" slice onto the shared
+	// PostgreSQL server (ROI P2 end-state). GOSTORM_PG_DSN unset -> unchanged
+	// bbolt/json behavior. When set and reachable, the Settings route is served from
+	// Postgres (gostream_prod/gostream_dev) so a color flip needs no file-level DB
+	// sync. The existing file copy is preserved via a non-destructive, byte-verified
+	// migration (reversible fallback); the Torrents/inode-map slice is untouched here.
+	if pgDB, err := NewPostgresDBFromEnv(); err != nil {
+		log.TLogln("Postgres settings backend requested but unavailable, keeping file backend:", err)
+	} else if pgDB != nil {
+		if _, mErr := MigrateSingle(settingsDB, pgDB, "Settings", "BitTorr"); mErr != nil {
+			log.TLogln("Postgres settings migration warning:", mErr)
+		}
+		settingsDB = pgDB
+		log.TLogln("Settings backend externalized to Postgres (GOSTORM_PG_DSN)")
+	}
+
+	dbRouter.RegisterRoute(settingsDB, "Settings")
 	dbRouter.RegisterRoute(bboltDB, "Torrents")
 	tdb = NewDBReadCache(dbRouter)
 }
