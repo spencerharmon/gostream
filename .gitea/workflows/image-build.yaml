@@ -41,8 +41,20 @@ jobs:
     container:
       image: golang:1.24-bookworm
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # NOTE: `actions/checkout@v4` is a Node.js action, and this job runs inside
+      # a plain `golang:1.24-bookworm` container (no node binary) rather than the
+      # runner's own host env — the marketplace action fails
+      # (`exec: "node": executable file not found`). A plain-shell git clone needs
+      # nothing but git (already in the golang base image) and works in ANY
+      # container, so it replaces the action in every job below.
+      - name: Checkout (plain git — no node dependency)
+        run: |
+          set -eux
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
 
       - name: Install cgo/FUSE build deps
         run: |
@@ -93,8 +105,14 @@ jobs:
       OCI_REGISTRY: ${{ vars.OCI_REGISTRY }}
       OCI_IMAGE: images/gostream
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout (plain git — no node dependency)
+        run: |
+          set -eux
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
 
       - name: Preflight — registry configuration present
         run: |
