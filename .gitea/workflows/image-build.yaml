@@ -10,9 +10,10 @@
 # registry hostname is hardcoded here. The OCI registry host is injected at run
 # time from the repo/org **Actions variable** `OCI_REGISTRY`, and push
 # credentials from the **secrets** `OCI_REGISTRY_USERNAME` / `OCI_REGISTRY_TOKEN`.
-# The image path segment `spencer/gostream` is a NAMESPACE only (renamed from the
-# legacy `zuul` namespace, ROI reconcile 19ae9d1f, 2026-08-03 — Zuul itself is
-# gone) — it is not an infrastructure identifier. Configure these on the Gitea
+# The image path segment `images/gostream` is a NAMESPACE only (renamed
+# `zuul`->`spencer` (ROI reconcile 19ae9d1f, 2026-08-03) then `spencer`->`images`
+# (ROI reconcile b4c24483, 2026-08-03) — Zuul itself is gone) — it is not an
+# infrastructure identifier. Configure these on the Gitea
 # repo (Settings -> Actions -> Variables/Secrets) so the workflow publishes to
 # the private Gitea OCI registry without leaking its hostname into public source.
 #
@@ -90,7 +91,7 @@ jobs:
       options: --privileged
     env:
       OCI_REGISTRY: ${{ vars.OCI_REGISTRY }}
-      OCI_IMAGE: spencer/gostream
+      OCI_IMAGE: images/gostream
     steps:
       - name: Checkout
         uses: actions/checkout@v4
