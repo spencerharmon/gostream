@@ -2,14 +2,16 @@ package utils
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
-	"gostream/internal/gostorm/log"
+	"tiramisu/internal/gostorm/log"
 
-	"gostream/internal/gostorm/settings"
+	"tiramisu/internal/gostorm/settings"
 
 	"github.com/anacrolix/torrent/iplist"
 )
@@ -57,9 +59,21 @@ func parseBlockList(buf []byte) (iplist.Ranger, error) {
 	}
 
 	if len(ranges) > 0 {
+		// iplist.New's Lookup binary-searches by First IP; the file is sorted by
+		// description text, not IP, so it must be sorted here or matches get missed.
+		sort.Slice(ranges, func(i, j int) bool {
+			return bytes.Compare(ranges[i].First, ranges[j].First) < 0
+		})
 		log.TLogln(fmt.Sprintf("Readed ranges: %d (Total lines: %d, Errors: %d)", len(ranges), lineCount, errorCount))
 		return iplist.New(ranges), nil
 	}
+	// Zero valid ranges from an otherwise-clean scan (no scanner.Err()) must still surface
+	// as an error: the caller treats a nil error as "reload succeeded" and would live-swap
+	// in a nil blocklist, silently disabling the filter instead of keeping the last-good one.
+	if err := scanner.Err(); err != nil {
+		log.TLogln(fmt.Sprintf("No ranges loaded from blocklist! (Lines read: %d, Errors: %d)", lineCount, errorCount))
+		return nil, err
+	}
 	log.TLogln(fmt.Sprintf("No ranges loaded from blocklist! (Lines read: %d, Errors: %d)", lineCount, errorCount))
-	return nil, scanner.Err()
+	return nil, fmt.Errorf("no valid ranges parsed (lines read: %d, errors: %d)", lineCount, errorCount)
 }

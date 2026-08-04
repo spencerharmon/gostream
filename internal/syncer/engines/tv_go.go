@@ -17,12 +17,13 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"gostream/internal/catalog"
-	"gostream/internal/catalog/tmdb"
-	"gostream/internal/catalog/torrentio"
-	"gostream/internal/library"
-	"gostream/internal/metadb"
-	"gostream/internal/prowlarr"
+	"tiramisu/internal/catalog"
+	"tiramisu/internal/catalog/tmdb"
+	"tiramisu/internal/catalog/torrentio"
+	"tiramisu/internal/config"
+	"tiramisu/internal/library"
+	"tiramisu/internal/metadb"
+	"tiramisu/internal/prowlarr"
 )
 
 // TVGoEngine is the pure Go implementation of TV sync.
@@ -48,6 +49,12 @@ type TVGoEngine struct {
 
 	blacklist     BlacklistData
 	blacklistFile string
+
+	invalidatePath func(string)
+
+	reITA         *regexp.Regexp
+	reExclLang    *regexp.Regexp
+	exclLanguages map[string]bool
 }
 
 // TVEpisodeEntry is a single entry in the TV episode registry.
@@ -79,6 +86,10 @@ type TVEngineConfig struct {
 	StateDir     string
 	LogsDir      string
 	ProwlarrCfg  prowlarr.ConfigProwlarr
+	// InvalidatePath, when set, is called after removing a stub file/dir so the FUSE
+	// layer drops its cached state for it (see main.invalidateSyncRemovedPath).
+	InvalidatePath func(string)
+	Language       config.LanguageConfig
 }
 
 // TV thresholds
@@ -90,7 +101,7 @@ const (
 	tv51Bonus          = 25
 	tvITABonus         = 40
 	tvFullpackBonus    = 500
-	tvMinSeeders4K     = 10
+	tvMinSeeders4K     = 5
 	tvMinSeeders       = 5
 	tvMinEpisodeSize   = 1073741824  // 1GB
 	tvMaxEpisodeSize   = 32212254720 // 30GB
@@ -101,9 +112,10 @@ const (
 )
 
 var (
-	reTV4K           = regexp.MustCompile(`(?i)2160p|4k|uhd`)
-	reTV1080p        = regexp.MustCompile(`(?i)1080p`)
-	reTVHDR          = regexp.MustCompile(`(?i)\bhdr\b|hdr10\+?|\bdv\b|dovi|dolby.?vision`)
+	reTV4K    = regexp.MustCompile(`(?i)2160p|4k|uhd`)
+	reTV1080p = regexp.MustCompile(`(?i)1080p`)
+	// \b treats "_" as a word char, so "\bhdr\b" misses "_HDR_" - use a custom boundary.
+	reTVHDR          = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])hdr(?:$|[^A-Za-z0-9])|hdr10\+?|(?:^|[^A-Za-z0-9])dv(?:$|[^A-Za-z0-9])|dovi|dolby.?vision`)
 	reTVAtmos        = regexp.MustCompile(`(?i)atmos`)
 	reTV51           = regexp.MustCompile(`(?i)5\.1|dd5|ddp5|dts|truehd`)
 	reTVITA          = regexp.MustCompile(`(?i)ita|🇮🇹|multi|dual`)
@@ -164,12 +176,31 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 		db:               db,
 		processedThisRun: make(map[string]bool),
 		blacklistFile:    blFile,
+		invalidatePath:   cfg.InvalidatePath,
+		reITA:            CompileLanguageRegex(cfg.Language.PreferredTerms, cfg.Language.PreferredFlags),
+		reExclLang:       CompileLanguageRegex(ExcludedTitleTerms(cfg.Language.ExcludedFlags), cfg.Language.ExcludedFlags),
+		exclLanguages:    ExcludedLanguageSet(cfg.Language.ExcludedFlags),
 	}
 
 	e.registry = e.loadRegistry()
 	e.blacklist = e.loadBlacklist()
 
 	return e
+}
+
+// removeStub deletes a stub file/dir, invalidates its FUSE cache state, and removes the
+// underlying torrent from GoStorm. hash may be empty (e.g. for a plain directory); a
+// failed RemoveTorrent doesn't block the stub deletion.
+func (e *TVGoEngine) removeStub(ctx context.Context, path, hash string) {
+	if hash != "" {
+		if err := e.gostorm.RemoveTorrent(ctx, hash); err != nil {
+			e.logger.Printf("[TVSync] WARNING: failed to remove torrent %s for %s: %v", hash, filepath.Base(path), err)
+		}
+	}
+	os.Remove(path)
+	if e.invalidatePath != nil {
+		e.invalidatePath(path)
+	}
 }
 
 func (e *TVGoEngine) loadBlacklist() BlacklistData {
@@ -212,6 +243,10 @@ func (e *TVGoEngine) Name() string { return "tv" }
 
 func (e *TVGoEngine) Run(ctx context.Context) error {
 	e.logger.Printf("Starting TV sync...")
+	// B1.1: reset per-run state so repeated scheduler invocations start clean.
+	// processedThisRun and stats are long-lived struct fields, not local vars.
+	e.processedThisRun = make(map[string]bool)
+	e.stats = TVSyncStats{}
 	e.populateRegistryFromExisting()
 	e.reconcileRegistry()
 
@@ -245,9 +280,12 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 	if e.db == nil {
 		e.saveRegistry()
 	}
-	e.cleanupOrphanedFiles()
-	e.cleanupOrphanedTorrents(ctx)
+	// B6.1: rehydrate before cleanup — if an MKV file exists on disk but its
+	// torrent is missing from GoStorm, restore it first. cleanupOrphanedFiles
+	// runs after so it cannot delete a file that rehydrate still needs.
 	e.rehydrateMissingTorrents(ctx)
+	e.cleanupOrphanedFiles(ctx)
+	e.cleanupOrphanedTorrents(ctx)
 
 	e.logger.Printf("TV sync complete: %d shows, %d episodes created, %d skipped, %d upgrades",
 		e.stats.Shows, e.stats.EpisodesCreated, e.stats.EpisodesSkipped, e.stats.Upgrades)
@@ -258,7 +296,9 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 		client := catalog.NewClient(10 * time.Second)
 		resp, err := catalog.Do(context.Background(), client, req)
-		if err == nil {
+		if err != nil {
+			e.logger.Printf("Warning: Plex library refresh failed: %v", err)
+		} else {
 			resp.Body.Close()
 		}
 	}
@@ -504,7 +544,12 @@ func (e *TVGoEngine) passesShowFilters(show tmdb.TVShow) bool {
 		}
 	}
 
-	// Language: English always accepted, others need premium IT provider
+	// Language: explicitly excluded languages are a hard reject regardless of
+	// provider availability; English is always accepted; other languages need
+	// a premium IT provider.
+	if e.exclLanguages[show.Language] {
+		return false
+	}
 	if show.Language == "en" {
 		return true
 	}
@@ -716,7 +761,7 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 		for s := startSeason; s <= endSeason; s++ {
 			targetSeasons = append(targetSeasons, s)
 		}
-		streams := e.prowlarr.FetchTorrents(imdbID, "series", showName, targetSeasons...)
+		streams := e.prowlarr.FetchTorrents(imdbID, "series", showName, 0, targetSeasons...)
 		for _, s := range streams {
 			h := strings.ToLower(s.InfoHash)
 			if h != "" && !seenHashes[h] {
@@ -726,20 +771,15 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 		}
 		e.logger.Printf("    Prowlarr: %d streams in %v", len(allStreams), time.Since(tp).Round(time.Millisecond))
 
-		// If Prowlarr returned streams but none survive classification, discard and try Torrentio.
-		if len(allStreams) > 0 {
-			anyUsable := false
-			for _, s := range allStreams {
-				if e.classifyStream(s) != nil {
-					anyUsable = true
-					break
-				}
-			}
-			if !anyUsable {
-				e.logger.Printf("    Prowlarr: all %d streams discarded — trying Torrentio", len(allStreams))
-				allStreams = allStreams[:0]
-				clear(seenHashes)
-			}
+		// If none of Prowlarr's streams survive the full classification (quality, season range,
+		// episode cap), discard and try Torrentio. Uses the same filter as the final result below,
+		// so a stream that's well-formed but for the wrong season correctly counts as "unusable"
+		// instead of silently skipping the fallback (found in production: Il Corsaro Blu returning
+		// old-season results for long-running shows suppressed the Torrentio fallback entirely).
+		if len(allStreams) > 0 && len(e.classifyAndFilter(allStreams, startSeason, endSeason, tmdbSeasonEps)) == 0 {
+			e.logger.Printf("    Prowlarr: all %d streams discarded — trying Torrentio", len(allStreams))
+			allStreams = allStreams[:0]
+			clear(seenHashes)
 		}
 	}
 
@@ -774,9 +814,16 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 		e.logger.Printf("    Torrentio fallback: %d streams from %d eps in %v", len(allStreams), epsFetched, time.Since(tt).Round(time.Millisecond))
 	}
 
-	// Classify
+	return e.classifyAndFilter(allStreams, startSeason, endSeason, tmdbSeasonEps)
+}
+
+// classifyAndFilter runs classifyStream on each raw stream and keeps only those matching the
+// target season range and TMDB's canonical episode count. Used both to decide whether Prowlarr's
+// results are usable at all (fallback trigger) and to build the final result, so both checks stay
+// in sync.
+func (e *TVGoEngine) classifyAndFilter(streams []prowlarr.Stream, startSeason, endSeason int, tmdbSeasonEps map[int]int) []TVStream {
 	var classified []TVStream
-	for _, s := range allStreams {
+	for _, s := range streams {
 		c := e.classifyStream(s)
 		if c == nil {
 			continue
@@ -792,7 +839,6 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 		}
 		classified = append(classified, *c)
 	}
-
 	return classified
 }
 
@@ -835,7 +881,7 @@ func (e *TVGoEngine) classifyStream(s prowlarr.Stream) *TVStream {
 		return nil
 	}
 
-	if reTVExclLang.MatchString(title) {
+	if e.reExclLang.MatchString(title) {
 		return nil
 	}
 
@@ -897,7 +943,7 @@ func (e *TVGoEngine) calculateQualityScore(text string, seeders int) int {
 		score += tv51Bonus
 	}
 
-	if reTVITA.MatchString(t) {
+	if e.reITA.MatchString(t) {
 		score += tvITABonus
 	}
 
@@ -1083,7 +1129,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 
 		if err := library.WriteStub(epPath, streamURL, vf.Length, magnet, ""); err == nil {
 			if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
-				os.Remove(existing.FilePath)
+				e.removeStub(ctx, existing.FilePath, existing.Hash)
 				e.stats.Upgrades++
 			}
 			e.registerEpisode(key, stream.QualityScore, hash, epPath, "fullpack")
@@ -1162,7 +1208,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream 
 
 	if err := library.WriteStub(epPath, streamURL, bestFile.Length, magnet, ""); err == nil {
 		if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
-			os.Remove(existing.FilePath)
+			e.removeStub(ctx, existing.FilePath, existing.Hash)
 			e.stats.Upgrades++
 		}
 		e.registerEpisode(key, stream.QualityScore, hash, epPath, "single")
@@ -1226,7 +1272,7 @@ func (e *TVGoEngine) reconcileRegistry() {
 	}
 }
 
-func (e *TVGoEngine) cleanupOrphanedFiles() {
+func (e *TVGoEngine) cleanupOrphanedFiles(ctx context.Context) {
 	if _, err := os.Stat(e.tvDir); err != nil {
 		return
 	}
@@ -1241,7 +1287,7 @@ func (e *TVGoEngine) cleanupOrphanedFiles() {
 			return nil
 		}
 		if !regPaths[path] {
-			os.Remove(path)
+			e.removeStub(ctx, path, e.readHashFromMKV(path))
 		}
 		return nil
 	})
@@ -1257,7 +1303,7 @@ func (e *TVGoEngine) cleanupOrphanedFiles() {
 	for i := len(dirs) - 1; i >= 0; i-- {
 		entries, _ := os.ReadDir(dirs[i])
 		if len(entries) == 0 {
-			os.Remove(dirs[i])
+			e.removeStub(ctx, dirs[i], "")
 		}
 	}
 }

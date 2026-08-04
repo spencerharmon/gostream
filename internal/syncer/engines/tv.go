@@ -6,8 +6,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"gostream/internal/metadb"
-	"gostream/internal/prowlarr"
+	"tiramisu/internal/config"
+	"tiramisu/internal/metadb"
+	"tiramisu/internal/prowlarr"
 )
 
 // TVSyncer runs the TV sync in pure Go (Fase 3).
@@ -27,7 +28,11 @@ type TVSyncerConfig struct {
 	StateDir     string
 	LogsDir      string
 	ProwlarrCfg  prowlarr.ConfigProwlarr
+	Language     config.LanguageConfig
 	DB           *metadb.DB // V1.7.1: Optional SQLite backend
+	// InvalidatePath, when set, is called after removing a stub file/dir so the FUSE
+	// layer drops its cached state for it (see main.invalidateSyncRemovedPath).
+	InvalidatePath func(string)
 }
 
 // NewTVSyncer creates a new Go-based TV syncer.
@@ -49,16 +54,18 @@ func NewTVSyncer(cfg TVSyncerConfig) *TVSyncer {
 	}
 
 	engineCfg := TVEngineConfig{
-		GoStormURL:   cfg.GoStormURL,
-		TMDBAPIKey:   cfg.TMDBAPIKey,
-		TorrentioURL: cfg.TorrentioURL,
-		PlexURL:      cfg.PlexURL,
-		PlexToken:    cfg.PlexToken,
-		PlexTVLib:    cfg.PlexTVLib,
-		TVDir:        tvDir,
-		StateDir:     stateDir,
-		LogsDir:      logsDir,
-		ProwlarrCfg:  cfg.ProwlarrCfg,
+		GoStormURL:     cfg.GoStormURL,
+		TMDBAPIKey:     cfg.TMDBAPIKey,
+		TorrentioURL:   cfg.TorrentioURL,
+		PlexURL:        cfg.PlexURL,
+		PlexToken:      cfg.PlexToken,
+		PlexTVLib:      cfg.PlexTVLib,
+		TVDir:          tvDir,
+		StateDir:       stateDir,
+		LogsDir:        logsDir,
+		ProwlarrCfg:    cfg.ProwlarrCfg,
+		Language:       cfg.Language,
+		InvalidatePath: cfg.InvalidatePath,
 	}
 
 	return &TVSyncer{

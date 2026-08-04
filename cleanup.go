@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"gostream/internal/cache"
-	"gostream/internal/gostorm/native"
-	"gostream/internal/gostorm/torr"
-	"gostream/internal/preload"
+	"tiramisu/internal/cache"
+	"tiramisu/internal/gostorm/native"
+	"tiramisu/internal/gostorm/torr"
+	"tiramisu/internal/preload"
 )
 
 // CleanupManager provides periodic cleanup of various in-memory structures
@@ -188,8 +188,10 @@ func (cm *CleanupManager) runCleanup() {
 			})
 		}
 
-		// Secondary: virtual paths for active torrents (served by FUSE, not on disk)
-		torrents := torr.ListTorrent()
+		// Secondary: virtual paths for active torrents (served by FUSE, not on disk).
+		// ListActiveTorrent() returns only in-memory torrents — no BoltDB deserialization.
+		// ListTorrent() would unmarshal all ~3000+ DB entries every cleanup cycle → OOM.
+		torrents := torr.ListActiveTorrent()
 		for _, t := range torrents {
 			if t == nil {
 				continue
@@ -274,8 +276,8 @@ func (cm *CleanupManager) runCleanup() {
 				// V273: PeekTorrent instead of GetTorrent — cleanup is read-only monitoring,
 				// must NOT reactivate dormant torrents (same pattern as cache.go fix).
 				if ps.Hash != "" {
-					if t := torr.PeekTorrent(ps.Hash); t != nil && t.Torrent != nil && t.IsPriority {
-						t.IsPriority = false
+					if t := torr.PeekTorrent(ps.Hash); t != nil && t.Torrent != nil && t.IsPriority.Load() {
+						t.IsPriority.Store(false)
 						t.SetAggressiveMode(false, 0)
 						cm.logger.Printf("[V273] Force Priority OFF for zombie torrent: %s", ps.Hash[:8])
 					}
@@ -320,25 +322,6 @@ func (cm *CleanupManager) runCleanup() {
 
 // --- Deleted Hashes Management ---
 
-func (cm *CleanupManager) AddDeletedHash(hash string) {
-	cm.deletedMu.Lock()
-	cm.deletedHashes[hash] = time.Now()
-	cm.deletedMu.Unlock()
-}
-
-func (cm *CleanupManager) RemoveDeletedHash(hash string) {
-	cm.deletedMu.Lock()
-	delete(cm.deletedHashes, hash)
-	cm.deletedMu.Unlock()
-}
-
-func (cm *CleanupManager) IsDeleted(hash string) bool {
-	cm.deletedMu.RLock()
-	_, exists := cm.deletedHashes[hash]
-	cm.deletedMu.RUnlock()
-	return exists
-}
-
 // --- File Offset Management ---
 
 // UpdateOffset records the last read position for a file
@@ -350,16 +333,6 @@ func (cm *CleanupManager) UpdateOffset(path string, offset int64, length int) {
 		timestamp: time.Now(),
 	}
 	cm.offsetsMu.Unlock()
-}
-
-func (cm *CleanupManager) GetOffset(path string) (int64, int, bool) {
-	cm.offsetsMu.RLock()
-	entry, exists := cm.fileOffsets[path]
-	cm.offsetsMu.RUnlock()
-	if !exists {
-		return 0, 0, false
-	}
-	return entry.offset, entry.length, true
 }
 
 // --- File Activity Management ---
@@ -376,31 +349,6 @@ func (cm *CleanupManager) GetLastActivity(path string) (time.Time, bool) {
 	t, exists := cm.fileActivities[path]
 	cm.activitiesMu.RUnlock()
 	return t, exists
-}
-
-func (cm *CleanupManager) GetIdleDuration(path string) time.Duration {
-	cm.activitiesMu.RLock()
-	last, exists := cm.fileActivities[path]
-	cm.activitiesMu.RUnlock()
-	if !exists {
-		return 0
-	}
-	return time.Since(last)
-}
-
-// Clear removes all data (for testing)
-func (cm *CleanupManager) Clear() {
-	cm.deletedMu.Lock()
-	cm.deletedHashes = make(map[string]time.Time)
-	cm.deletedMu.Unlock()
-
-	cm.offsetsMu.Lock()
-	cm.fileOffsets = make(map[string]*offsetEntry)
-	cm.offsetsMu.Unlock()
-
-	cm.activitiesMu.Lock()
-	cm.fileActivities = make(map[string]time.Time)
-	cm.activitiesMu.Unlock()
 }
 
 // Statistics

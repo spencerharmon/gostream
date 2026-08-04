@@ -2,13 +2,13 @@ package config
 
 import (
 	"encoding/json"
-	"gostream/internal/prowlarr"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"tiramisu/internal/prowlarr"
 
 	"github.com/google/uuid"
 )
@@ -77,6 +77,16 @@ type QualityScoringConfig struct {
 	TV     *TVQualityWeights `json:"tv,omitempty"`
 }
 
+// LanguageConfig controls preferred/excluded audio-language matching used
+// by the Movie and TV sync engines when scoring and filtering torrents.
+type LanguageConfig struct {
+	// PreferredTerms are case-insensitive, word-boundary-matched release-name terms (e.g. "ita", "multi", "dual").
+	PreferredTerms []string `json:"preferred_terms"`
+	// PreferredFlags/ExcludedFlags are ISO 3166-1 alpha-2 codes matched against flag emoji in indexer result lines.
+	PreferredFlags []string `json:"preferred_flags"`
+	ExcludedFlags  []string `json:"excluded_flags"`
+}
+
 // Config holds all configurable parameters for the FUSE proxy
 type Config struct {
 	// --- Internal / Derived Fields ---
@@ -87,8 +97,6 @@ type Config struct {
 	MasterConcurrencyLimit int    `json:"master_concurrency_limit"` // Global limit for concurrent HTTP requests to GoStorm
 	ReadAheadBudgetMB      int64  `json:"read_ahead_budget_mb"`     // Global budget for read-ahead in MB
 	MetadataCacheSizeMB    int64  `json:"metadata_cache_size_mb"`   // Size of metadata LRU cache in MB (V178)
-	WriteBufferSizeKB      int    `json:"write_buffer_size_kb"`     // Size of write buffer in KB
-	ReadBufferSizeKB       int    `json:"read_buffer_size_kb"`
 	FuseBlockSize          int    `json:"fuse_block_size_bytes"`
 	StreamingThresholdKB   int64  `json:"streaming_threshold_kb"`
 	LogLevel               string `json:"log_level"`
@@ -99,7 +107,6 @@ type Config struct {
 	NegativeTimeoutSeconds float64 `json:"negative_timeout_seconds"`
 
 	// --- HTTP Resilience ---
-	HTTPClientTimeoutSeconds int `json:"http_client_timeout_seconds"`
 	MaxRetryAttempts         int `json:"max_retry_attempts"`
 	RetryDelayMS             int `json:"retry_delay_ms"`
 	RescueGracePeriodSeconds int `json:"rescue_grace_period_seconds"`
@@ -116,14 +123,15 @@ type Config struct {
 	MaxCacheEntries         int `json:"max_cache_entries"`
 
 	// --- Connectivity ---
-	GoStormBaseURL  string `json:"gostorm_url"`
-	ProxyListenPort int    `json:"proxy_listen_port"`
-	MetricsPort     int    `json:"metrics_port"`
-	BlockListURL    string `json:"blocklist_url"`
-	AIURL           string `json:"ai_url"`      // V1.4.5: AI Optimizer sidecar URL
-	AIProvider      string `json:"ai_provider"` // V1.7.1: Provider type (local, openrouter, openai)
-	AIModel         string `json:"ai_model"`    // V1.7.1: Model ID for cloud providers
-	AI_API_KEY      string `json:"ai_api_key"`  // V1.7.1: API key for cloud providers
+	GoStormBaseURL   string `json:"gostorm_url"`
+	ProxyListenPort  int    `json:"proxy_listen_port"`
+	MetricsPort      int    `json:"metrics_port"`
+	BlockListEnabled bool   `json:"blocklist_enabled"`
+	BlockListURL     string `json:"blocklist_url"`
+	AIURL            string `json:"ai_url"`      // V1.4.5: AI Optimizer sidecar URL
+	AIProvider       string `json:"ai_provider"` // V1.7.1: Provider type (local, openrouter, openai)
+	AIModel          string `json:"ai_model"`    // V1.7.1: Model ID for cloud providers
+	AI_API_KEY       string `json:"ai_api_key"`  // V1.7.1: API key for cloud providers
 
 	// --- FUSE Paths ---
 	// Fallback when CLI args are omitted. CLI args always take precedence.
@@ -141,20 +149,14 @@ type Config struct {
 	MaxConcurrentHTTP       int           `json:"-"`
 	RateLimitRequestsPerSec int           `json:"-"`
 	PreloadWorkers          int           `json:"-"`
-	MaxIdleConns            int           `json:"-"`
-	MaxIdleConnsPerHost     int           `json:"-"`
 	MaxConnsPerHost         int           `json:"-"`
 	ConcurrencyLimit        int           `json:"-"`
-	HTTPConnectTimeout      time.Duration `json:"-"`
-	HTTPReadTimeout         time.Duration `json:"-"`
 	KeepaliveInterval       time.Duration `json:"-"`
 	KeepaliveIdleStart      time.Duration `json:"-"`
 	KeepaliveMaxIdle        time.Duration `json:"-"`
 	CacheTTL                time.Duration `json:"-"`
 	UID                     uint32        `json:"-"`
 	GID                     uint32        `json:"-"`
-	WriteBufferSize         int           `json:"-"`
-	ReadBufferSize          int           `json:"-"`
 
 	// --- Disk Warmup ---
 	DiskWarmupQuotaGB int64 `json:"disk_warmup_quota_gb"` // Total SSD quota for warmup cache (default: 32)
@@ -187,6 +189,9 @@ type Config struct {
 	// --- Quality Scoring ---
 	QualityScoringConfig QualityScoringConfig `json:"quality_scoring"`
 
+	// --- Language Matching ---
+	Language LanguageConfig `json:"language"`
+
 	// --- Engine Scripts (populated in LoadConfig, not from JSON) ---
 	EngineScripts map[string]EngineConfig `json:"-"`
 
@@ -197,7 +202,7 @@ type Config struct {
 
 	// --- State DB (V1.7.1) ---
 	EnableStateDB bool   `json:"enable_state_db"` // default: true
-	StateDBPath   string `json:"state_db_path"`   // default: <STATE>/gostream.db
+	StateDBPath   string `json:"state_db_path"`   // default: <STATE>/gostream.db (unchanged: on-disk schema/identity path, do not rename to tiramisu.db)
 
 	// --- External library/add API ---
 	// Server-side timeout (seconds) used by POST /api/library/add when
@@ -226,8 +231,6 @@ func LoadConfig() Config {
 		MasterConcurrencyLimit: 25,
 		ReadAheadBudgetMB:      256,
 		MetadataCacheSizeMB:    50, // Default 50MB for metadata
-		WriteBufferSizeKB:      64,
-		ReadBufferSizeKB:       64,
 		FuseBlockSize:          1048576,
 		StreamingThresholdKB:   128,
 		LogLevel:               "INFO",
@@ -236,9 +239,8 @@ func LoadConfig() Config {
 		EntryTimeoutSeconds:    1.0,
 		NegativeTimeoutSeconds: 0.0,
 
-		HTTPClientTimeoutSeconds: 30,
-		MaxRetryAttempts:         6,
-		RetryDelayMS:             500,
+		MaxRetryAttempts: 6,
+		RetryDelayMS:     500,
 
 		PreloadWorkersCount:   4,
 		PreloadInitialDelayMS: 1000,
@@ -250,6 +252,15 @@ func LoadConfig() Config {
 		DiskWarmupQuotaGB:       15,
 		WarmupHeadSizeMB:        64,
 
+		Language: LanguageConfig{
+			PreferredTerms: []string{"ita", "multi", "dual"},
+			PreferredFlags: []string{"IT"},
+			ExcludedFlags: []string{
+				"ES", "FR", "DE", "RU", "CN", "JP", "KR", "TH", "PT", "BR",
+				"UA", "PL", "NL", "TR", "SA", "IN", "CZ", "HU", "RO",
+			},
+		},
+
 		Scheduler: SchedulerConfig{
 			Enabled:       false, // off by default — won't break installs using cron
 			MoviesSync:    DailyJobConfig{Enabled: true, DaysOfWeek: []int{1, 4}, Hour: 3, Minute: 0},
@@ -257,10 +268,11 @@ func LoadConfig() Config {
 			WatchlistSync: WatchlistSyncConfig{Enabled: true, IntervalHours: 1},
 		},
 
-		TorrentioURL:    "https://torrentio.strem.fun",
-		GoStormBaseURL:  "http://127.0.0.1:8090",
-		ProxyListenPort: 8080,
-		MetricsPort:     9080,
+		TorrentioURL:     "https://torrentio.strem.fun",
+		GoStormBaseURL:   "http://127.0.0.1:8090",
+		ProxyListenPort:  8080,
+		MetricsPort:      9080,
+		BlockListEnabled: false,
 
 		EnableTelemetry: true,
 		TelemetryURL:    "https://telemetry.gostream.workers.dev",
@@ -405,10 +417,10 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("AI_API_KEY"); v != "" {
 		c.AI_API_KEY = v
 	}
-	if v := firstEnv("GOSTREAM_PLEX_URL", "PLEX_URL"); v != "" {
+	if v := firstEnv("TIRAMISU_PLEX_URL", "GOSTREAM_PLEX_URL", "PLEX_URL"); v != "" {
 		c.Plex.URL = v
 	}
-	if v := firstEnv("GOSTREAM_PLEX_TOKEN", "PLEX_TOKEN"); v != "" {
+	if v := firstEnv("TIRAMISU_PLEX_TOKEN", "GOSTREAM_PLEX_TOKEN", "PLEX_TOKEN"); v != "" {
 		c.Plex.Token = v
 	}
 	if v := os.Getenv("MKV_PROXY_LOG_LEVEL"); v != "" {
@@ -439,8 +451,6 @@ func (c *Config) finalize() {
 	// Sync legacy fields with unified master limit
 	c.ConcurrencyLimit = c.MasterConcurrencyLimit
 	c.MaxConcurrentHTTP = c.MasterConcurrencyLimit
-	c.MaxIdleConns = c.MasterConcurrencyLimit
-	c.MaxIdleConnsPerHost = c.MasterConcurrencyLimit
 	c.MaxConnsPerHost = c.MasterConcurrencyLimit
 
 	// Map JSON fields to internal logic fields
@@ -449,6 +459,12 @@ func (c *Config) finalize() {
 	if c.ReadAheadBudget < 10*1024*1024 {
 		c.ReadAheadBudget = 10 * 1024 * 1024 // Min 10MB
 	}
+	// Budget must cover at least one adaptive chunk (ReadAheadBase, up to 16MB): a smaller
+	// budget makes every pump Put() exceed it permanently (the just-added chunk is exempt from
+	// eviction), turning the soft-limit throttle in nativePumpChunk into a permanent near-freeze.
+	if c.ReadAheadBudget < c.ReadAheadBase {
+		c.ReadAheadBudget = c.ReadAheadBase
+	}
 
 	// Calculate MetadataCacheSize in bytes
 	c.MetadataCacheSize = c.MetadataCacheSizeMB * 1024 * 1024
@@ -456,12 +472,7 @@ func (c *Config) finalize() {
 		c.MetadataCacheSize = 1 * 1024 * 1024 // Min 1MB
 	}
 
-	// Calculate buffer sizes in bytes
-	c.WriteBufferSize = c.WriteBufferSizeKB * 1024
-	c.ReadBufferSize = c.ReadBufferSizeKB * 1024
 	c.StreamingThreshold = c.StreamingThresholdKB * 1024
-	c.HTTPConnectTimeout = time.Duration(c.HTTPClientTimeoutSeconds) * time.Second
-	c.HTTPReadTimeout = 45 * time.Second // Keep fixed for now
 	c.PreloadWorkers = c.PreloadWorkersCount
 	if c.MaxConcurrentPrefetch <= 0 {
 		c.MaxConcurrentPrefetch = 3 // Safety fallback
@@ -494,12 +505,12 @@ func (c *Config) LogConfig(logger *log.Logger) {
 	logger.Printf("Source: %s", c.ConfigPath)
 	logger.Printf("MasterConcurrencyLimit: %d", c.MasterConcurrencyLimit)
 	logger.Printf("ReadAheadBudget: %d MB", c.ReadAheadBudgetMB)
-	logger.Printf("Buffers (W/R): %d KB / %d KB (Block: %d)", c.WriteBufferSizeKB, c.ReadBufferSizeKB, c.FuseBlockSize)
+	logger.Printf("FUSE Block Size: %d", c.FuseBlockSize)
 	logger.Printf("StreamingThreshold: %d KB", c.StreamingThresholdKB)
 	logger.Printf("LogLevel: %s", c.LogLevel)
 	logger.Printf("GoStormBaseURL: %s", c.GoStormBaseURL)
 	logger.Printf("FUSE Timeouts (Attr/Entry/Neg): %.1f/%.1f/%.1f", c.AttrTimeoutSeconds, c.EntryTimeoutSeconds, c.NegativeTimeoutSeconds)
-	logger.Printf("HTTP Connect Timeout: %ds, Retries: %d, Delay: %dms", c.HTTPClientTimeoutSeconds, c.MaxRetryAttempts, c.RetryDelayMS)
+	logger.Printf("HTTP Retries: %d, Delay: %dms", c.MaxRetryAttempts, c.RetryDelayMS)
 	logger.Printf("Preload Engine: Workers=%d, Delay=%dms", c.PreloadWorkersCount, c.PreloadInitialDelayMS)
 
 	logger.Printf("Cache Management: Cleanup=%dm, MaxEntries=%d", c.CacheCleanupIntervalMin, c.MaxCacheEntries)

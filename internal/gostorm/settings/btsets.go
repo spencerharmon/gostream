@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"gostream/internal/gostorm/log"
+	"tiramisu/internal/gostorm/log"
 )
 
 type BTSets struct {
@@ -40,8 +40,13 @@ type BTSets struct {
 	DownloadRateLimit int // in kb, 0 - inf
 	UploadRateLimit   int // in kb, 0 - inf
 	ConnectionsLimit  int
-	PeersListenPort   int
-	BlockListURL      string
+	// AggressivePeerManagement enables warmup-phase PEX churn and tail-hedging for
+	// streaming cold-start latency. Defaults to true (see SetDefaultConfig/loadBTSets) —
+	// validated in production since 2026-07-03: circuit breaker threshold confirmed
+	// against real trip data, no panics/regressions observed.
+	AggressivePeerManagement bool
+	PeersListenPort          int
+	BlockListURL             string
 
 	// HTTPS
 	SslPort int
@@ -160,6 +165,7 @@ func SetDefaultConfig() {
 	sets.DisableUTP = true
 	sets.ShowFSActiveTorr = true
 	sets.StoreSettingsInJson = true
+	sets.AggressivePeerManagement = true
 	BTsets = sets
 	if !ReadOnly {
 		buf, err := json.Marshal(BTsets)
@@ -215,6 +221,7 @@ func loadBTSets() {
 	sets.DisableUTP = true
 	sets.ShowFSActiveTorr = true
 	sets.StoreSettingsInJson = true
+	sets.AggressivePeerManagement = true
 	BTsets = sets
 	if !ReadOnly {
 		buf, err := json.Marshal(BTsets)

@@ -5,7 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"gostream/internal/metadb"
+	"tiramisu/internal/config"
+	"tiramisu/internal/metadb"
 )
 
 // TestHealthzHandlerAlwaysReturns200 verifies /healthz (liveness) never
@@ -32,12 +33,21 @@ func TestHealthzHandlerAlwaysReturns200(t *testing.T) {
 func TestReadyzHandler(t *testing.T) {
 	// main package globals are shared process-wide state; save/restore so
 	// this test can't leak into others run in the same binary.
+	// main() is never run under `go test`, so globalConfig may still be a nil
+	// atomic.Pointer at this point; seed it with a zero-value Config so gc()
+	// is safe to dereference below (mirrors main()'s eventual globalConfig.Store).
+	if gc() == nil {
+		globalConfig.Store(&config.Config{})
+	}
+
 	origFuseReady := fuseMountReady.Load()
-	origEnableStateDB := globalConfig.EnableStateDB
+	origEnableStateDB := gc().EnableStateDB
 	origStateDB := stateDB
 	defer func() {
 		fuseMountReady.Store(origFuseReady)
-		globalConfig.EnableStateDB = origEnableStateDB
+		cfg := *gc()
+		cfg.EnableStateDB = origEnableStateDB
+		globalConfig.Store(&cfg)
 		stateDB = origStateDB
 	}()
 
@@ -63,7 +73,9 @@ func TestReadyzHandler(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fuseMountReady.Store(tc.fuseReady)
-			globalConfig.EnableStateDB = tc.enableStateDB
+			cfg := *gc()
+			cfg.EnableStateDB = tc.enableStateDB
+			globalConfig.Store(&cfg)
 			stateDB = tc.db
 
 			req := httptest.NewRequest(http.MethodGet, "/readyz", nil)

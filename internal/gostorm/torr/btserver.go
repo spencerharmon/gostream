@@ -14,14 +14,15 @@ import (
 	"github.com/anacrolix/dht/v2"
 	"github.com/anacrolix/publicip"
 	"github.com/anacrolix/torrent"
+	"github.com/anacrolix/torrent/iplist"
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/mse"
 	"golang.org/x/time/rate"
 
-	"gostream/internal/gostorm/settings"
-	"gostream/internal/gostorm/torr/storage/torrstor"
-	"gostream/internal/gostorm/torr/utils"
-	"gostream/internal/gostorm/version"
+	"tiramisu/internal/gostorm/settings"
+	"tiramisu/internal/gostorm/torr/storage/torrstor"
+	"tiramisu/internal/gostorm/torr/utils"
+	"tiramisu/internal/gostorm/version"
 )
 
 type BTServer struct {
@@ -30,7 +31,8 @@ type BTServer struct {
 
 	storage *torrstor.Storage
 
-	torrents map[metainfo.Hash]*Torrent
+	torrents   map[metainfo.Hash]*Torrent
+	tickerStop chan struct{}
 
 	mu sync.Mutex
 }
@@ -118,7 +120,20 @@ func init() {
 func NewBTS() *BTServer {
 	bts := new(BTServer)
 	bts.torrents = make(map[metainfo.Hash]*Torrent)
+	bts.tickerStop = make(chan struct{})
 	return bts
+}
+
+// SetIPBlocklist live-swaps the underlying client's blocklist, so a background
+// refresh (see main.updateBlockList) takes effect immediately instead of only on
+// the next Connect(). No-op if the client isn't up yet.
+func (bt *BTServer) SetIPBlocklist(list iplist.Ranger) {
+	bt.mu.Lock()
+	client := bt.client
+	bt.mu.Unlock()
+	if client != nil {
+		client.SetIPBlocklist(list)
+	}
 }
 
 func (bt *BTServer) Connect() error {
@@ -127,6 +142,7 @@ func (bt *BTServer) Connect() error {
 	bt.configure(context.TODO())
 	bt.client, err = torrent.NewClient(bt.config)
 	bt.torrents = make(map[metainfo.Hash]*Torrent)
+	bt.tickerStop = make(chan struct{})
 	bt.mu.Unlock()
 
 	// V1.4.0: Align anacrolix reader max readahead with configured CacheSize
@@ -145,24 +161,33 @@ func (bt *BTServer) StartTicker() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		bt.mu.Lock()
-		if bt.client == nil {
+	bt.mu.Lock()
+	stop := bt.tickerStop
+	bt.mu.Unlock()
+
+	for {
+		select {
+		case <-ticker.C:
+			bt.mu.Lock()
+			if bt.client == nil {
+				bt.mu.Unlock()
+				return
+			}
+
+			// Snapshot list to avoid holding lock during updates
+			list := make([]*Torrent, 0, len(bt.torrents))
+			for _, t := range bt.torrents {
+				list = append(list, t)
+			}
 			bt.mu.Unlock()
+
+			// Update each torrent concurrently or sequentially?
+			// Sequentially is safer for CPU spikes, and UpdateStats is fast.
+			for _, t := range list {
+				t.UpdateStats()
+			}
+		case <-stop:
 			return
-		}
-
-		// Snapshot list to avoid holding lock during updates
-		list := make([]*Torrent, 0, len(bt.torrents))
-		for _, t := range bt.torrents {
-			list = append(list, t)
-		}
-		bt.mu.Unlock()
-
-		// Update each torrent concurrently or sequentially?
-		// Sequentially is safer for CPU spikes, and UpdateStats is fast.
-		for _, t := range list {
-			t.UpdateStats()
 		}
 	}
 }
@@ -173,6 +198,7 @@ func (bt *BTServer) Disconnect() {
 	if bt.client != nil {
 		bt.client.Close()
 		bt.client = nil
+		close(bt.tickerStop)
 		utils.FreeOSMemGC()
 	}
 }
@@ -223,6 +249,7 @@ func (bt *BTServer) configure(ctx context.Context) {
 	bt.config.HTTPUserAgent = userAgent
 	bt.config.ExtendedHandshakeClientVersion = cliVers
 	bt.config.EstablishedConnsPerTorrent = settings.BTsets.ConnectionsLimit // V301: Respect DB settings instead of hardcoded 35
+	bt.config.AggressivePeerManagement = settings.BTsets.AggressivePeerManagement
 	// V87-Balanced-Discovery: Optimized for Pi + home router
 	// Balance fast discovery with system safety
 	bt.config.TotalHalfOpenConns = 500          // V264: Was 800, reduced for Pi 4 stability

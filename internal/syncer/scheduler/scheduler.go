@@ -87,11 +87,6 @@ func New(cfg SchedulerConfig, jobs map[string]Syncer, statePath string) *Schedul
 	return s
 }
 
-// Tracker returns the JobTracker for a named job, creating if needed.
-func (s *Scheduler) Tracker(name string) *JobTracker {
-	return s.state.Tracker(name)
-}
-
 // Run starts the scheduler loop. Blocks until stop is closed.
 func (s *Scheduler) Run(stop <-chan struct{}) {
 	logger := log.New(os.Stdout, "[Scheduler] ", log.LstdFlags)
@@ -124,6 +119,9 @@ func (s *Scheduler) TriggerRun(name string) error {
 		return ErrAlreadyRunning
 	}
 
+	// V2.0: Set running before spawn to prevent concurrent launches from tick().
+	jt.SetRunning(true)
+	s.state.Save()
 	go s.runJob(syncer, jt)
 	return nil
 }
@@ -157,6 +155,8 @@ func (s *Scheduler) tick() {
 			continue
 		}
 
+		// V2.0: Set running before spawn to prevent concurrent TriggerRun/tick races.
+		jt.SetRunning(true)
 		go s.runJob(syncer, jt)
 	}
 
@@ -242,7 +242,6 @@ func (s *Scheduler) runJob(syncer Syncer, jt *JobTracker) {
 		s.mu.Unlock()
 	}()
 
-	jt.SetRunning(true)
 	s.state.Save()
 	log.Printf("[Scheduler] %s started", name)
 
@@ -439,10 +438,4 @@ func (jt *JobTracker) Snapshot() JobState {
 	jt.mu.Lock()
 	defer jt.mu.Unlock()
 	return jt.state
-}
-
-// EnsureDir creates the directory for a path if it doesn't exist.
-func EnsureDir(path string) error {
-	dir := filepath.Dir(path)
-	return os.MkdirAll(dir, 0755)
 }

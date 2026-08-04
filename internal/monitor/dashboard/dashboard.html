@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GoStream Health Monitor</title>
+<title>Tiramisu Health Monitor</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
@@ -22,11 +22,10 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh
 <!-- Header -->
 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-6">
   <div class="flex items-center gap-3">
-    <h1 class="text-2xl md:text-3xl font-bold">GoStream Health Monitor</h1>
-    <a id="updateBadge" href="https://github.com/MrRobotoGit/gostream/releases/latest" target="_blank" rel="noopener" class="hidden bg-amber-600 hover:bg-amber-500 text-white text-xs font-medium py-1 px-2.5 rounded-full transition no-underline whitespace-nowrap"></a>
+    <h1 class="text-lg sm:text-xl md:text-2xl font-bold">Tiramisu Health Monitor</h1>
+    <a id="updateBadge" href="https://github.com/MrRobotoGit/tiramisu/releases/latest" target="_blank" rel="noopener" class="hidden no-underline whitespace-nowrap"></a>
   </div>
   <div class="flex items-center gap-3">
-    <span class="text-xs text-slate-400">Last update: <span id="lastUpdate">--:--:--</span></span>
     <button onclick="doRestart()" class="bg-slate-700 hover:bg-red-600 text-white text-xs py-1.5 px-3 rounded transition whitespace-nowrap">Restart</button>
   </div>
 </div>
@@ -39,6 +38,16 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh
       <span class="text-2xl font-bold"><span id="speed">0</span> <span class="text-sm text-slate-400">Mbps</span></span>
     </div>
     <div style="height:150px;position:relative"><canvas id="speedChart"></canvas></div>
+    <canvas id="shieldTimeline" style="width:100%;height:8px;display:block;margin-top:6px"></canvas>
+    <div class="flex items-center gap-4 mt-1.5">
+      <span class="flex items-center gap-1.5 text-[10px] text-slate-500">
+        <span style="width:7px;height:7px;border-radius:50%;background:#f97316;display:inline-block;flex-shrink:0"></span>Adaptive Shield
+      </span>
+      <span class="flex items-center gap-1.5 text-[10px] text-slate-500">
+        <span style="width:16px;height:7px;border-radius:3px;background:rgba(234,179,8,0.50);display:inline-block;flex-shrink:0"></span>Strict Mode
+      </span>
+      <span class="text-[10px] text-slate-500">Banned Peers: <span id="v304BannedPeers">0</span></span>
+    </div>
   </div>
   <div class="glass rounded-xl p-4">
     <div class="flex items-center justify-between mb-3">
@@ -63,6 +72,7 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh
       <div class="flex items-center gap-4 mt-1 text-xs text-slate-500">
         <span><span class="inline-block w-2 h-2 bg-blue-500 rounded mr-1"></span>Active <span class="text-blue-400" id="fuseActivePct">0%</span></span>
         <span><span class="inline-block w-2 h-2 bg-slate-500 rounded mr-1"></span>Stale <span id="fuseStalePct">0%</span></span>
+        <span><span class="inline-block w-2 h-2 bg-blue-500 rounded mr-1"></span>Hit Rate <span class="text-blue-400" id="cacheHitRatePct">0%</span></span>
       </div>
     </div>
   </div>
@@ -78,23 +88,23 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh
 <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
   <div class="glass rounded-xl p-4" id="c-gostorm">
     <div class="text-xs text-slate-400 uppercase tracking-wider mb-2">GoStorm</div>
-    <div class="flex items-center gap-2"><span id="s-gostorm" class="text-2xl">&#9679;</span><span id="l-gostorm" class="text-lg font-bold">--</span></div>
+    <div class="flex items-center gap-2"><span id="s-gostorm" class="text-base sm:text-lg">&#9679;</span><span id="l-gostorm" class="text-sm sm:text-base font-bold">--</span></div>
   </div>
   <div class="glass rounded-xl p-4" id="c-fuse">
     <div class="text-xs text-slate-400 uppercase tracking-wider mb-2">FUSE</div>
-    <div class="flex items-center gap-2"><span id="s-fuse" class="text-2xl">&#9679;</span><span id="l-fuse" class="text-lg font-bold">--</span></div>
+    <div class="flex items-center gap-2"><span id="s-fuse" class="text-base sm:text-lg">&#9679;</span><span id="l-fuse" class="text-sm sm:text-base font-bold">--</span></div>
   </div>
   <div class="glass rounded-xl p-4" id="c-vpn">
     <div class="text-xs text-slate-400 uppercase tracking-wider mb-2">VPN</div>
-    <div class="flex items-center gap-2"><span id="s-vpn" class="text-2xl">&#9679;</span><span id="l-vpn" class="text-lg font-bold">--</span></div>
+    <div class="flex items-center gap-2"><span id="s-vpn" class="text-base sm:text-lg">&#9679;</span><span id="l-vpn" class="text-sm sm:text-base font-bold">--</span></div>
   </div>
   <div class="glass rounded-xl p-4" id="c-natpmp">
     <div class="text-xs text-slate-400 uppercase tracking-wider mb-2">NAT-PMP</div>
-    <div class="flex items-center gap-2"><span id="s-natpmp" class="text-2xl">&#9679;</span><span id="l-natpmp" class="text-lg font-bold">--</span></div>
+    <div class="flex items-center gap-2"><span id="s-natpmp" class="text-base sm:text-lg">&#9679;</span><span id="l-natpmp" class="text-sm sm:text-base font-bold">--</span></div>
   </div>
   <div class="glass rounded-xl p-4" id="c-plex">
     <div class="text-xs text-slate-400 uppercase tracking-wider mb-2">Plex</div>
-    <div class="flex items-center gap-2"><span id="s-plex" class="text-2xl">&#9679;</span><span id="l-plex" class="text-lg font-bold">--</span></div>
+    <div class="flex items-center gap-2"><span id="s-plex" class="text-base sm:text-lg">&#9679;</span><span id="l-plex" class="text-sm sm:text-base font-bold">--</span></div>
   </div>
   <div class="glass rounded-xl p-4">
     <div class="text-xs text-slate-400 uppercase tracking-wider mb-2">System</div>
@@ -120,7 +130,7 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh
     <div class="flex items-center justify-between mb-3">
       <span class="text-xs text-slate-400 uppercase tracking-wider">Logs</span>
       <select id="logFile" onchange="loadLogs()" class="bg-slate-700 text-xs text-slate-300 rounded px-2 py-1 border border-slate-600">
-        <option value="gostream">gostream</option>
+        <option value="tiramisu">tiramisu</option>
         <option value="movies-sync">movies-sync</option>
         <option value="tv-sync">tv-sync</option>
         <option value="watchlist-sync">watchlist-sync</option>
@@ -135,7 +145,7 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh
 <!-- Footer -->
 <div class="flex items-center justify-between text-xs text-slate-600 mt-4">
   <span>Uptime: <span id="uptime">--</span></span>
-  <span>GoStream Unified Engine</span>
+  <span>Tiramisu Unified Engine</span>
 </div>
 
 </div>
@@ -165,12 +175,55 @@ function svc(el,st){
 function fmtSize(b){if(!b||b<1024)return'0 B';const u=['B','KB','MB','GB','TB'];let i=0,v=b;while(v>=1024&&i<u.length-1){v/=1024;i++}return v.toFixed(1)+' '+u[i]}
 function trunc(t,n){return t&&t.length>n?t.slice(0,n)+'...':t||'--'}
 
+function drawShieldTimeline(events,history){
+  const canvas=document.getElementById('shieldTimeline');
+  if(!canvas)return;
+  const W=canvas.offsetWidth||canvas.parentElement.offsetWidth||300;
+  const H=8;
+  canvas.width=W;canvas.height=H;
+  const ctx=canvas.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='rgba(15,23,42,0.5)';
+  ctx.fillRect(0,0,W,H);
+  if(!history||history.length<2)return;
+  const tMin=history[0].t,tMax=history[history.length-1].t;
+  if(tMax<=tMin)return;
+  const toX=t=>Math.round((t-tMin)/(tMax-tMin)*W);
+  const sorted=[...(events||[])].sort((a,b)=>a.t-b.t);
+  // Draw STRICT segments as oblongs (rounded rect)
+  const drawOblong=(x1,x2,alpha)=>{
+    const w=Math.max(6,x2-x1),r=3;
+    ctx.fillStyle=`rgba(234,179,8,${alpha})`;
+    ctx.beginPath();
+    if(ctx.roundRect){ctx.roundRect(x1,1,w,H-2,r);}
+    else{ctx.rect(x1,1,w,H-2);}
+    ctx.fill();
+  };
+  let strictAt=null;
+  for(const ev of sorted){
+    if(ev.type==='strict'){strictAt=ev.t;}
+    else if(ev.type==='restore'&&strictAt!==null){
+      drawOblong(Math.max(0,toX(strictAt)),Math.min(W,toX(ev.t)),0.50);
+      strictAt=null;
+    }
+  }
+  if(strictAt!==null){drawOblong(Math.max(0,toX(strictAt)),W,0.55);}
+  // Draw corruption/strict-start dots (orange)
+  for(const ev of sorted){
+    if(ev.type==='corruption'||ev.type==='strict'){
+      const x=toX(ev.t);
+      if(x<0||x>W)continue;
+      ctx.beginPath();ctx.arc(x,H/2,3,0,Math.PI*2);
+      ctx.fillStyle='#f97316';ctx.fill();
+    }
+  }
+}
+
 async function load(){
   try{
-    const[hR,tR,sR]=await Promise.all([fetch('/api/health'),fetch('/api/torrents'),fetch('/api/speed-history')]);
-    const h=await hR.json(),torrents=await tR.json(),history=await sR.json();
+    const[hR,tR,sR,shR]=await Promise.all([fetch('/api/health'),fetch('/api/torrents'),fetch('/api/speed-history'),fetch('/api/shield-events')]);
+    const h=await hR.json(),torrents=await tR.json(),history=await sR.json(),shieldEvts=await shR.json();
 
-    document.getElementById('lastUpdate').textContent=new Date().toLocaleTimeString();
     document.getElementById('uptime').textContent=h.uptime;
     document.getElementById('speed').textContent=h.download_mbps.toFixed(1);
     document.getElementById('totalT').textContent=h.total_torrents;
@@ -187,6 +240,8 @@ async function load(){
     document.getElementById('fuseActivePct').textContent=h.fuse_active_pct.toFixed(1)+'%';
     document.getElementById('fuseStalePct').textContent=h.fuse_stale_pct.toFixed(1)+'%';
     document.getElementById('fuseBudget').textContent=h.fuse_budget_mb.toFixed(0)+' MB budget';
+    document.getElementById('cacheHitRatePct').textContent=(h.cache_hit_rate_pct==null)?'—':h.cache_hit_rate_pct.toFixed(1)+'%';
+    document.getElementById('v304BannedPeers').textContent=h.v304_banned_peers ?? 0;
 
     svcKeys.forEach(k=>svc(k,h[k]));
 
@@ -195,6 +250,7 @@ async function load(){
       chart.data.datasets[0].data=history.map(p=>p.v);
       chart.update('none');
     }
+    drawShieldTimeline(shieldEvts,history);
 
     // Active streams
     const active=(torrents||[]).filter(t=>t.status!=='idle').sort((a,b)=>b.speed_mbs-a.speed_mbs);
@@ -230,7 +286,7 @@ async function load(){
         <div class="text-[10px] text-slate-600">peers · seeds</div>
       </div>
     </div>`;}).join('');}
-  }catch(e){document.getElementById('lastUpdate').textContent='connection error';}
+  }catch(e){console.error('Dashboard update failed:',e);}
 
   // Scheduler
   try{
@@ -300,7 +356,7 @@ async function killStream(hash){
 }
 
 function doRestart(){
-  if(!confirm('Restart GoStream? Active streams will be interrupted.'))return;
+  if(!confirm('Restart Tiramisu? Active streams will be interrupted.'))return;
   fetch('/api/restart',{method:'POST'}).then(()=>{
     document.body.innerHTML='<div class="flex items-center justify-center h-screen text-2xl text-slate-400">Restarting... please wait</div>';
     setTimeout(()=>location.reload(),8000);
@@ -314,8 +370,17 @@ async function checkUpdate(){
     if(d.update_available&&d.latest_version){
       const b=document.getElementById('updateBadge');
       const isDev=!d.version||d.version==='dev';
-      b.textContent=isDev?'Stable: '+d.latest_version:'Update '+d.latest_version;
-      b.title=isDev?'Dev build — latest stable: '+d.latest_version:'Current: '+d.version+' → '+d.latest_version;
+      if(isDev){
+        // Dev build: can't confirm the running code actually matches the latest tag, so show
+        // plain text (not the amber "update available" badge, which would be a false alarm).
+        b.className='hidden no-underline whitespace-nowrap text-xs text-slate-500';
+        b.textContent='Stable: '+d.latest_version;
+        b.title='Dev build — latest stable: '+d.latest_version;
+      }else{
+        b.className='hidden bg-amber-600 hover:bg-amber-500 text-white text-[10px] font-medium py-0.5 px-2 rounded-full transition no-underline whitespace-nowrap';
+        b.textContent='Update '+d.latest_version;
+        b.title='Current: '+d.version+' → '+d.latest_version;
+      }
       b.classList.remove('hidden');
     }
   }catch(_){}

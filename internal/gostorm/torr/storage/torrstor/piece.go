@@ -7,9 +7,14 @@ import (
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/storage"
 
-	"gostream/internal/gostorm/log"
-	"gostream/internal/gostorm/settings"
+	"tiramisu/internal/gostorm/log"
+	"tiramisu/internal/gostorm/settings"
 )
+
+// strictEscalationCapSeconds bounds the 30s-per-cycle escalation (see strictCycleCount) at its
+// slowest tier: 30 minutes, reached only after sustained/repeated corruption (cycle 60+), not on
+// an isolated event.
+const strictEscalationCapSeconds = 1800
 
 var (
 	// V303: Atomic Shield Protection
@@ -22,7 +27,12 @@ var (
 	// staticCorruptionCount tracks consecutive corrupted pieces for delayed activation.
 	staticCorruptionCount atomic.Int32
 	// strictCycleCount escalates the clean streak required each time STRICT is re-triggered.
-	// 1st cycle: 30s, 2nd: 60s, 3rd: 90s, 4th+: 120s. Resets on media.stop.
+	// 1st cycle: 30s, 2nd: 60s, 3rd: 90s, ... capped at strictEscalationCapSeconds. Deliberately
+	// NOT reset on media.stop (Plex-internal seeks/pauses must not erase escalation history on a
+	// genuinely corrupted swarm - see ResetShield). It IS reset once a full clean streak is
+	// achieved (below) - without that, this global, never-otherwise-reset counter would keep
+	// climbing for the process's entire uptime and every future single corruption event
+	// anywhere would immediately serve the escalation cap instead of a fresh 30s.
 	strictCycleCount atomic.Int32
 )
 
@@ -34,13 +44,14 @@ func IsResponsive() bool {
 	return settings.GetResponsiveMode() && !shieldActive.Load()
 }
 
-// ResetShield resets the Adaptive Shield to its base state.
-// Called on media.stop to start fresh for the next viewing.
+// ResetShield deactivates the Adaptive Shield on media.stop.
+// strictCycleCount is intentionally preserved so that Plex-internal stop/play
+// events (seeks, buffer probes) do not reset the escalation history. The cycle
+// resets naturally only when a full clean streak is achieved.
 func ResetShield() {
 	shieldActive.Store(false)
 	isWatchdogRunning.Store(false)
 	staticCorruptionCount.Store(0)
-	strictCycleCount.Store(0)
 }
 
 type Piece struct {
@@ -49,8 +60,8 @@ type Piece struct {
 	Id   int   `json:"-"`
 	Size int64 `json:"size"`
 
-	Complete bool  `json:"complete"`
-	Accessed int64 `json:"accessed"`
+	Complete atomic.Bool `json:"-"`
+	Accessed int64       `json:"accessed"`
 
 	mPiece *MemPiece `json:"-"`
 
@@ -78,12 +89,12 @@ func (p *Piece) ReadAt(b []byte, off int64) (n int, err error) {
 }
 
 func (p *Piece) MarkComplete() error {
-	p.Complete = true
+	p.Complete.Store(true)
 	return nil
 }
 
 func (p *Piece) MarkNotComplete() error {
-	p.Complete = false
+	p.Complete.Store(false)
 
 	// V-evict-guard: buffer nil = pezzo evicted dalla cache, non corruzione da peer.
 	// Evita falsi positivi AdaptiveShield durante eviction sotto pressione RAM.
@@ -107,8 +118,8 @@ func (p *Piece) MarkNotComplete() error {
 		if count > 1 {
 			cycle := strictCycleCount.Add(1)
 			cleanNeeded := int64(30) * int64(cycle)
-			if cleanNeeded > 120 {
-				cleanNeeded = 120
+			if cleanNeeded > strictEscalationCapSeconds {
+				cleanNeeded = strictEscalationCapSeconds
 			}
 			log.TLogln("[AdaptiveShield] Persistent corruption - Force STRICT mode (Shield: ACTIVE, cycle", cycle, ", need", cleanNeeded, "s clean)")
 			shieldActive.Store(true)
@@ -131,8 +142,8 @@ func (p *Piece) MarkNotComplete() error {
 				if cleanNeeded < 30*time.Second {
 					cleanNeeded = 30 * time.Second
 				}
-				if cleanNeeded > 120*time.Second {
-					cleanNeeded = 120 * time.Second
+				if cleanNeeded > strictEscalationCapSeconds*time.Second {
+					cleanNeeded = strictEscalationCapSeconds * time.Second
 				}
 
 				if elapsed > cleanNeeded {
@@ -140,6 +151,12 @@ func (p *Piece) MarkNotComplete() error {
 						log.TLogln("[AdaptiveShield] Clean streak detected (", cleanNeeded.Seconds(), "s) - Restoring FAST mode (Shield: OFF)")
 					}
 					staticCorruptionCount.Store(0)
+					// Escalation history clears on a genuine clean streak (see strictCycleCount's
+					// doc comment) - only media.stop/seek must NOT reset it. Without this, cycle
+					// only ever grows for the process's lifetime and every future isolated
+					// corruption event would immediately hit strictEscalationCapSeconds instead of
+					// starting fresh at 30s.
+					strictCycleCount.Store(0)
 					isWatchdogRunning.Store(false)
 					return
 				}
@@ -152,15 +169,19 @@ func (p *Piece) MarkNotComplete() error {
 
 func (p *Piece) Completion() storage.Completion {
 	return storage.Completion{
-		Complete: p.Complete,
+		Complete: p.Complete.Load(),
 		Ok:       true,
 	}
 }
 
 func (p *Piece) Release() {
 	p.mPiece.Release()
-	if !p.cache.isClosed {
-		p.cache.torrent.Piece(p.Id).SetPriority(torrent.PiecePriorityNone)
-		p.cache.torrent.Piece(p.Id).UpdateCompletion()
+	p.cache.muReaders.RLock()
+	closed := p.cache.isClosed.Load()
+	torr := p.cache.torrent
+	p.cache.muReaders.RUnlock()
+	if !closed && torr != nil {
+		torr.Piece(p.Id).SetPriority(torrent.PiecePriorityNone)
+		torr.Piece(p.Id).UpdateCompletion()
 	}
 }

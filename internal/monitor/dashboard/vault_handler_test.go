@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"gostream/internal/config"
-	"gostream/internal/warmup"
+	"tiramisu/internal/config"
+	"tiramisu/internal/warmup"
 )
 
 func writeStub(t *testing.T, dir, name, hash string, size int64) string {

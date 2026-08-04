@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"gostream/internal/gostorm/log"
-	"gostream/internal/gostorm/settings"
-	"gostream/internal/gostorm/web"
+	"tiramisu/internal/gostorm/log"
+	"tiramisu/internal/gostorm/settings"
+	"tiramisu/internal/gostorm/web"
 )
 
 func Start() {
@@ -123,17 +123,4 @@ func removeAllFiles(path string) {
 		os.Remove(name)
 	}
 	os.Remove(path)
-}
-
-func WaitServer() string {
-	err := web.Wait()
-	if err != nil {
-		return err.Error()
-	}
-	return ""
-}
-
-func Stop() {
-	web.Stop()
-	settings.CloseDB()
 }

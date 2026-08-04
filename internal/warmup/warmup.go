@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"gostream/internal/gostorm/settings"
+	"tiramisu/internal/gostorm/settings"
 )
 
 // FileSize is the per-file head cache cap. Set at init from config, default 64 MB.
@@ -28,11 +28,55 @@ const (
 
 var diskQuotaGB int64
 
-// SetQuotaGB sets the disk warmup quota in gigabytes.
+// SetQuotaGB sets the disk warmup quota in gigabytes directly, bypassing
+// InitDiskWarmup's other init-time side effects. Exists for tests that need
+// to force a specific quota without re-running full disk-warmup init.
 func SetQuotaGB(gb int64) { diskQuotaGB = gb }
 
 // DiskWarmup is the global instance, nil when disabled.
 var DiskWarmup *DiskWarmupCache
+
+// OnWarmupStateChange, if set, is called synchronously from the single writeWorker goroutine at
+// the exact moment a head warmup fetch starts (active=true) or completes (active=false) - wired
+// up once at startup (main.go) to signal the anacrolix-torrent fork's Torrent.SetWarmupActive.
+// Deliberately synchronous, not polled: WriteChunk() only enqueues onto writeCh and returns
+// immediately, so a caller checking IsWarmingUp() right after WriteChunk() returns can race ahead
+// of this worker actually processing the write - this callback fires precisely when the state
+// itself transitions, eliminating that race by construction.
+var OnWarmupStateChange func(hash string, fileID int, active bool)
+
+var warmupDurationBuckets [8]atomic.Int64 // <2s,<5s,<10s,<15s,<30s,<60s,<120s,>=120s
+
+func recordWarmupDuration(d time.Duration) {
+	s := d.Seconds()
+	idx := 7
+	switch {
+	case s < 2:
+		idx = 0
+	case s < 5:
+		idx = 1
+	case s < 10:
+		idx = 2
+	case s < 15:
+		idx = 3
+	case s < 30:
+		idx = 4
+	case s < 60:
+		idx = 5
+	case s < 120:
+		idx = 6
+	}
+	warmupDurationBuckets[idx].Add(1)
+}
+
+// WarmupDurationBucketCounts returns a snapshot of the bucket counts for /metrics.
+func WarmupDurationBucketCounts() [8]int64 {
+	var out [8]int64
+	for i := range warmupDurationBuckets {
+		out[i] = warmupDurationBuckets[i].Load()
+	}
+	return out
+}
 
 // V261: sync.Pool for write buffers — avoids 16MB heap allocs per chunk.
 var warmupWritePool = sync.Pool{
@@ -78,6 +122,7 @@ type DiskWarmupCache struct {
 	handles      sync.Map   // path -> *cachedHandle (cached file descriptors)
 	sizeCache    sync.Map   // V264: path -> sizeEntry (cached file sizes with TTL)
 	tailCoverage sync.Map   // V265: path -> *tailRange (written range tracking)
+	warmupStarts sync.Map   // path -> time.Time (STARTING timestamp, for duration histogram)
 	writeCh      chan warmupWrite
 
 	// Vault Mode: hashes marked persistent bypass FileSize cap and are
@@ -165,8 +210,18 @@ func (d *DiskWarmupCache) handleReaper() {
 		d.handles.Range(func(key, val interface{}) bool {
 			ch := val.(*cachedHandle)
 			if now.UnixNano()-ch.lastUsedNano.Load() > handleIdleMax.Nanoseconds() {
-				d.handles.Delete(key)
-				ch.f.Close()
+				// V2.0: Use LoadAndDelete + double-check to prevent TOCTOU with getHandle.
+				// If getHandle updated lastUsedNano between Range and delete, re-insert.
+				if actual, loaded := d.handles.LoadAndDelete(key); loaded {
+					ac := actual.(*cachedHandle)
+					if now.UnixNano()-ac.lastUsedNano.Load() < handleIdleMax.Nanoseconds() {
+						d.handles.Store(key, ac)
+						return true
+					}
+					ac.closed.Store(true)
+					ac.f.Close()
+					d.warmupStarts.Delete(key)
+				}
 			}
 			return true
 		})
@@ -200,6 +255,10 @@ func (d *DiskWarmupCache) closeHandle(path string) {
 		ch.closed.Store(true) // mark before Close so writeWorker can detect stale handle
 		ch.f.Close()
 	}
+	// Aborted warmups (eviction, hash removal, idle close) never reach the
+	// completion branch in processWrite that LoadAndDeletes warmupStarts —
+	// clear it here so the entry doesn't leak forever under a rotating cache.
+	d.warmupStarts.Delete(path)
 }
 
 func (d *DiskWarmupCache) writeWorker() {
@@ -276,7 +335,11 @@ func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off
 		newCh := &cachedHandle{f: f}
 		newCh.lastUsedNano.Store(time.Now().UnixNano())
 		d.handles.Store(path, newCh)
+		d.warmupStarts.Store(path, time.Now())
 		logf.Printf("[DiskWarmup] STARTING %s at offset %d", filepath.Base(path), off)
+		if OnWarmupStateChange != nil {
+			OnWarmupStateChange(hash, fileID, true)
+		}
 	}
 
 	ch, err := d.getHandle(path)
@@ -309,7 +372,13 @@ func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off
 	d.sizeCache.Store(path, sizeEntry{size: currentSize, updatedAt: time.Now()})
 
 	if !persistent && off+int64(n) >= FileSize {
+		if startVal, ok := d.warmupStarts.LoadAndDelete(path); ok {
+			recordWarmupDuration(time.Since(startVal.(time.Time)))
+		}
 		logf.Printf("[DiskWarmup] COMPLETED %s", filepath.Base(path))
+		if OnWarmupStateChange != nil {
+			OnWarmupStateChange(hash, fileID, false)
+		}
 	}
 }
 
@@ -487,29 +556,6 @@ func (d *DiskWarmupCache) ReadTail(hash string, fileID int, buf []byte, absolute
 
 	n, err := ch.f.ReadAt(buf, relOffset)
 	return n, err
-}
-
-func (d *DiskWarmupCache) GetTailRange(hash string, fileID int) int64 {
-	path := d.tailPath(hash, fileID)
-	if _, ok := d.missing.Load(path); ok {
-		return 0
-	}
-
-	if val, ok := d.sizeCache.Load(path); ok {
-		entry := val.(sizeEntry)
-		if time.Since(entry.updatedAt) < 10*time.Second {
-			return entry.size
-		}
-	}
-
-	fi, err := os.Stat(path)
-	if err != nil {
-		d.missing.Store(path, time.Now())
-		return 0
-	}
-
-	d.sizeCache.Store(path, sizeEntry{size: fi.Size(), updatedAt: time.Now()})
-	return fi.Size()
 }
 
 func (d *DiskWarmupCache) RemoveHash(hash string) {

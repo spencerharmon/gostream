@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -16,9 +17,19 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"tiramisu/internal/catalog"
 )
 
 const speedHistorySize = 60
+const shieldEventWindow = 10 * time.Minute
+
+// ShieldEvent represents an AdaptiveShield log event.
+// Type: "corruption" (single bad piece), "strict" (STRICT mode started), "restore" (FAST mode restored).
+type ShieldEvent struct {
+	Type string `json:"type"`
+	Time int64  `json:"t"` // UnixMilli
+}
 
 // HealthStatus holds the current system health snapshot.
 type HealthStatus struct {
@@ -51,6 +62,16 @@ type HealthStatus struct {
 	FUSEBudgetMB  float64 `json:"fuse_budget_mb"`
 	FUSEActiveMB  float64 `json:"fuse_active_mb"`
 	FUSEStaleMB   float64 `json:"fuse_stale_mb"`
+
+	// CacheHitRatePct is global (all active streams combined, not per-torrent) - from
+	// Tiramisu's /metrics/profiling, reflects how much of what the player asked for was served
+	// from the fast local read-ahead cache vs. required a direct HTTP fetch. nil (JSON null)
+	// when no torrent is active, rather than showing a stale cumulative value.
+	CacheHitRatePct *float64 `json:"cache_hit_rate_pct"`
+
+	// V304BannedPeers is a process-lifetime count of peer IPs banned for sending
+	// corrupt pieces (V304 session ban). Never resets until the service restarts.
+	V304BannedPeers int `json:"v304_banned_peers"`
 }
 
 // ServiceStatus tracks a single service's health.
@@ -95,19 +116,23 @@ const (
 
 // Collector polls system services on a ticker.
 type Collector struct {
-	gostormURL string
-	metricsURL string
-	fusePath   string // FUSE mount point (for mount status check)
-	sourcePath string // physical_source_path (for file counting)
-	vpnIface   string
-	plexURL    string
-	plexToken  string
-	natpmpPort int
+	gostormURL   string
+	metricsURL   string
+	profilingURL string
+	fusePath     string // FUSE mount point (for mount status check)
+	sourcePath   string // physical_source_path (for file counting)
+	vpnIface     string
+	plexURL      string
+	plexToken    string
+	natpmpPort   int
+
+	logsDir string
 
 	mu           sync.RWMutex
 	status       HealthStatus
 	torrents     []TorrentInfo
 	speedHistory []SpeedPoint
+	shieldEvents []ShieldEvent
 	start        time.Time
 	httpClient   *http.Client
 
@@ -122,16 +147,18 @@ type Collector struct {
 }
 
 // New creates a Collector.
-func New(gostormURL, fusePath, sourcePath, vpnIface, plexURL, plexToken string, natpmpPort, metricsPort int) *Collector {
+func New(gostormURL, fusePath, sourcePath, vpnIface, plexURL, plexToken string, natpmpPort, metricsPort int, logsDir string) *Collector {
 	return &Collector{
 		gostormURL:   gostormURL,
 		metricsURL:   fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort),
+		profilingURL: fmt.Sprintf("http://127.0.0.1:%d/metrics/profiling", metricsPort),
 		fusePath:     fusePath,
 		sourcePath:   sourcePath,
 		vpnIface:     vpnIface,
 		plexURL:      plexURL,
 		plexToken:    plexToken,
 		natpmpPort:   natpmpPort,
+		logsDir:      logsDir,
 		start:        time.Now(),
 		speedHistory: make([]SpeedPoint, 0, speedHistorySize),
 		httpClient:   &http.Client{Timeout: 5 * time.Second},
@@ -178,6 +205,59 @@ func (c *Collector) SpeedHistory() []SpeedPoint {
 	return out
 }
 
+// ShieldEvents returns the recent AdaptiveShield event list.
+func (c *Collector) ShieldEvents() []ShieldEvent {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]ShieldEvent, len(c.shieldEvents))
+	copy(out, c.shieldEvents)
+	return out
+}
+
+var (
+	reShieldTS      = regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})`)
+	reShieldStrict  = regexp.MustCompile(`\[AdaptiveShield\].*Force STRICT mode`)
+	reShieldRestore = regexp.MustCompile(`\[AdaptiveShield\].*Restoring FAST mode`)
+	reShieldCorr    = regexp.MustCompile(`\[AdaptiveShield\] (?:Single|Persistent) corruption`)
+)
+
+// parseShieldEvents reads the last portion of tiramisu.log and extracts
+// AdaptiveShield events within the last shieldEventWindow.
+func (c *Collector) parseShieldEvents() []ShieldEvent {
+	if c.logsDir == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(c.logsDir, "tiramisu.log"))
+	if err != nil {
+		return nil
+	}
+	if len(data) > 256*1024 {
+		data = data[len(data)-256*1024:]
+	}
+	cutoff := time.Now().Add(-shieldEventWindow)
+	var events []ShieldEvent
+	for _, line := range strings.Split(string(data), "\n") {
+		m := reShieldTS.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		t, err := time.ParseInLocation("2006/01/02 15:04:05", m[1], time.Local)
+		if err != nil || t.Before(cutoff) {
+			continue
+		}
+		ms := t.UnixMilli()
+		switch {
+		case reShieldStrict.MatchString(line):
+			events = append(events, ShieldEvent{Type: "strict", Time: ms})
+		case reShieldRestore.MatchString(line):
+			events = append(events, ShieldEvent{Type: "restore", Time: ms})
+		case reShieldCorr.MatchString(line):
+			events = append(events, ShieldEvent{Type: "corruption", Time: ms})
+		}
+	}
+	return events
+}
+
 // PlexURL returns the configured Plex base URL (for server-side proxy use only).
 func (c *Collector) PlexURL() string { return c.plexURL }
 
@@ -187,6 +267,13 @@ func (c *Collector) PlexToken() string { return c.plexToken }
 // GostormURL returns the GoStorm API base URL.
 func (c *Collector) GostormURL() string { return c.gostormURL }
 
+// Known limit: each fetch below has its own 3s timeout, but collect() itself has no shared
+// cycle-wide deadline - if multiple endpoints degrade at once (e.g. a VPN/network blip affecting
+// GoStorm+Plex+metrics simultaneously), one collect() call can still take up to ~20s in the worst
+// case (down from ~45-90s pre-timeout-fix, but not a hard per-cycle ceiling). Fully bounding this
+// would need either a shared context.WithTimeout wrapping the whole cycle, or running the
+// independent fetches concurrently - out of scope for now, revisit if staleness becomes a problem
+// in practice.
 func (c *Collector) collect() {
 	s := HealthStatus{
 		Timestamp:  time.Now(),
@@ -227,11 +314,18 @@ func (c *Collector) collect() {
 	}
 	s.TotalTorrents = len(torrents)
 	s.ActiveCount = activeCount
+
+	// Global cache hit rate from /metrics/profiling - only meaningful while something is
+	// actively streaming, otherwise it's a stale cumulative value from the last session.
+	if activeCount > 0 {
+		c.fetchCacheHitRate(&s)
+	}
 	s.TotalPeers = totalPeers
 	s.TotalSeeders = totalSeeders
 	s.DownloadMbps = totalSpeedMB * 8
 
 	point := SpeedPoint{Time: time.Now().UnixMilli(), Speed: s.DownloadMbps}
+	shieldEvts := c.parseShieldEvents()
 
 	c.mu.Lock()
 	c.status = s
@@ -240,12 +334,20 @@ func (c *Collector) collect() {
 	if len(c.speedHistory) > speedHistorySize {
 		c.speedHistory = c.speedHistory[len(c.speedHistory)-speedHistorySize:]
 	}
+	c.shieldEvents = shieldEvts
 	c.mu.Unlock()
 }
 
 func (c *Collector) fetchTorrents() []TorrentInfo {
-	resp, err := c.httpClient.Post(c.gostormURL+"/torrents", "application/json",
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.gostormURL+"/torrents",
 		strings.NewReader(`{"action":"active"}`))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := catalog.Do(ctx, c.httpClient, req)
 	if err != nil {
 		return nil
 	}
@@ -300,7 +402,13 @@ func (c *Collector) fetchTorrents() []TorrentInfo {
 }
 
 func (c *Collector) fetchFUSEBuffer(s *HealthStatus) {
-	resp, err := c.httpClient.Get(c.metricsURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.metricsURL, nil)
+	if err != nil {
+		return
+	}
+	resp, err := catalog.Do(ctx, c.httpClient, req)
 	if err != nil {
 		return
 	}
@@ -316,6 +424,8 @@ func (c *Collector) fetchFUSEBuffer(s *HealthStatus) {
 	stale := jsonFloat(m, "read_ahead_stale_bytes")
 	budget := jsonFloat(m, "read_ahead_budget")
 
+	s.V304BannedPeers = int(jsonFloat(m, "v304_banned_peers"))
+
 	if budget > 0 {
 		s.FUSEBudgetMB = budget / 1024 / 1024
 		s.FUSEActiveMB = active / 1024 / 1024
@@ -323,6 +433,28 @@ func (c *Collector) fetchFUSEBuffer(s *HealthStatus) {
 		s.FUSEActivePct = active / budget * 100
 		s.FUSEStalePct = stale / budget * 100
 	}
+}
+
+func (c *Collector) fetchCacheHitRate(s *HealthStatus) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.profilingURL, nil)
+	if err != nil {
+		return
+	}
+	resp, err := catalog.Do(ctx, c.httpClient, req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return
+	}
+	rate := jsonFloat(m, "cache_hit_rate_pct")
+	s.CacheHitRatePct = &rate
 }
 
 func jsonFloat(m map[string]interface{}, key string) float64 {
@@ -675,7 +807,13 @@ func (c *Collector) fetchPlexSessions() map[string]plexSession {
 	}
 
 	url := fmt.Sprintf("%s/status/sessions?X-Plex-Token=%s", c.plexURL, c.plexToken)
-	resp, err := c.httpClient.Get(url)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return result
+	}
+	resp, err := catalog.Do(ctx, c.httpClient, req)
 	if err != nil {
 		return result
 	}

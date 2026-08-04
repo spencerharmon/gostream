@@ -11,17 +11,18 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
 
-	"gostream/internal/catalog"
-	"gostream/internal/catalog/mediaserver"
-	"gostream/internal/catalog/tmdb"
-	"gostream/internal/catalog/torrentio"
-	"gostream/internal/prowlarr"
-	"gostream/internal/syncer/quality"
+	"tiramisu/internal/catalog"
+	"tiramisu/internal/catalog/mediaserver"
+	"tiramisu/internal/catalog/tmdb"
+	"tiramisu/internal/catalog/torrentio"
+	"tiramisu/internal/prowlarr"
+	"tiramisu/internal/syncer/quality"
 )
 
 // WatchlistGoEngine is the pure Go implementation of watchlist sync.
@@ -123,7 +124,8 @@ func (e *WatchlistGoEngine) Run(ctx context.Context) error {
 			continue
 		}
 
-		streams, err := e.getStreams(ctx, item.IMDBID, item.Title)
+		year, _ := strconv.Atoi(item.Year)
+		streams, err := e.getStreams(ctx, item.IMDBID, item.Title, year)
 		if err != nil || len(streams) == 0 {
 			skipped++
 			continue
@@ -361,9 +363,9 @@ func (e *WatchlistGoEngine) isAlreadyPresent(item WatchlistItem, imdbSet map[str
 	return titleIndex[norm] != ""
 }
 
-func (e *WatchlistGoEngine) getStreams(ctx context.Context, imdbID, title string) ([]prowlarr.Stream, error) {
+func (e *WatchlistGoEngine) getStreams(ctx context.Context, imdbID, title string, year int) ([]prowlarr.Stream, error) {
 	if e.prowlarr != nil {
-		streams := e.prowlarr.FetchTorrents(imdbID, "movie", title)
+		streams := e.prowlarr.FetchTorrents(imdbID, "movie", title, year)
 		if len(streams) > 0 {
 			return streams, nil
 		}

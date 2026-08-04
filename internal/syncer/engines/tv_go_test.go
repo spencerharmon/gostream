@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"gostream/internal/library"
-	"gostream/internal/prowlarr"
+	"tiramisu/internal/library"
+	"tiramisu/internal/prowlarr"
 )
 
 func TestTVClassifySeriesPackS01ToS03AndSeasonWindowOverlap(t *testing.T) {
@@ -203,6 +203,16 @@ func TestTVProcessFullpackDoesNotRemoveTorrentWhenExistingEpisodeSkipped(t *test
 
 func testTVEngine(t *testing.T) *TVGoEngine {
 	t.Helper()
+	// Mirrors config.LoadConfig's default LanguageConfig so classify/quality
+	// scoring behaves the same as production instead of never-matching nil
+	// regexes (e.reITA/e.reExclLang are per-instance since the upstream
+	// rebase replaced the old package-level reTVITA constant).
+	preferredTerms := []string{"ita", "multi", "dual"}
+	preferredFlags := []string{"IT"}
+	excludedFlags := []string{
+		"ES", "FR", "DE", "RU", "CN", "JP", "KR", "TH", "PT", "BR",
+		"UA", "PL", "NL", "TR", "SA", "IN", "CZ", "HU", "RO",
+	}
 	return &TVGoEngine{
 		tvDir:            t.TempDir(),
 		stateDir:         t.TempDir(),
@@ -210,6 +220,8 @@ func testTVEngine(t *testing.T) *TVGoEngine {
 		registry:         map[string]TVEpisodeEntry{},
 		processedThisRun: map[string]bool{},
 		blacklist:        BlacklistData{Hashes: map[string]string{}},
+		reITA:            CompileLanguageRegex(preferredTerms, preferredFlags),
+		reExclLang:       CompileLanguageRegex(ExcludedTitleTerms(excludedFlags), excludedFlags),
 	}
 }
 

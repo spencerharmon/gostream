@@ -10,9 +10,9 @@ import (
 
 	"github.com/anacrolix/torrent"
 
-	"gostream/internal/gostorm/log"
-	"gostream/internal/gostorm/settings"
-	"gostream/internal/gostorm/torr/storage/state"
+	"tiramisu/internal/gostorm/log"
+	"tiramisu/internal/gostorm/settings"
+	"tiramisu/internal/gostorm/torr/storage/state"
 
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
@@ -49,8 +49,8 @@ type Cache struct {
 
 	activeReaders atomic.Int32
 
-	isRemove     bool
-	isClosed     bool
+	isRemove     atomic.Bool
+	isClosed     atomic.Bool
 	IsAggressive bool // V217: Aggressive download priority
 	MasterLimit  int  // V218: Master limit from config.json
 	lastClean    time.Time
@@ -112,7 +112,9 @@ func (c *Cache) Init(info *metainfo.Info, hash metainfo.Hash) {
 }
 
 func (c *Cache) SetTorrent(torr *torrent.Torrent) {
+	c.muReaders.Lock()
 	c.torrent = torr
+	c.muReaders.Unlock()
 }
 
 func (c *Cache) SetAggressive(enabled bool, masterLimit int) {
@@ -125,6 +127,8 @@ func (c *Cache) SetAggressive(enabled bool, masterLimit int) {
 }
 
 func (c *Cache) Piece(m metainfo.Piece) storage.PieceImpl {
+	c.muReaders.RLock()
+	defer c.muReaders.RUnlock()
 	if val, ok := c.pieces[m.Index()]; ok {
 		return val
 	}
@@ -132,15 +136,27 @@ func (c *Cache) Piece(m metainfo.Piece) storage.PieceImpl {
 }
 
 func (c *Cache) Close() error {
+	c.muReaders.Lock()
+	if c.isClosed.Load() {
+		c.muReaders.Unlock()
+		return nil
+	}
+	c.isClosed.Store(true)
+
 	if c.torrent != nil {
 		log.TLogln("Close cache for:", c.torrent.Name(), c.hash)
 	} else {
 		log.TLogln("Close cache for:", c.hash)
 	}
-	c.isClosed = true
-	close(c.cleanStop) // V280: Stop background goroutine (cleanTrigger never closed → no panic on send)
 
-	delete(c.storage.caches, c.hash)
+	close(c.cleanStop)
+
+	// Note: c.storage.caches cleanup is handled by Storage.CloseHash() and Storage.Close()
+	// to avoid concurrent map modification during range iteration in Storage.Close().
+
+	c.readers = nil
+	c.pieces = nil
+	c.muReaders.Unlock()
 
 	if settings.BTsets.RemoveCacheOnDrop {
 		name := filepath.Join(settings.BTsets.TorrentsSavePath, c.hash.HexString())
@@ -149,16 +165,11 @@ func (c *Cache) Close() error {
 		}
 	}
 
-	c.muReaders.Lock()
-	c.readers = nil
-	c.pieces = nil
-	c.muReaders.Unlock()
-
 	return nil
 }
 
 func (c *Cache) removePiece(piece *Piece) {
-	if !c.isClosed {
+	if !c.isClosed.Load() {
 		piece.Release()
 	}
 }
@@ -182,6 +193,7 @@ func (c *Cache) GetState() *state.CacheState {
 	piecesState := make(map[int]state.ItemState, 0)
 	var fill int64 = 0
 
+	c.muReaders.RLock()
 	if len(c.pieces) > 0 {
 		for _, p := range c.pieces {
 			if p.Size > 0 {
@@ -194,12 +206,13 @@ func (c *Cache) GetState() *state.CacheState {
 					Id:        p.Id,
 					Size:      p.Size,
 					Length:    c.pieceLength,
-					Completed: p.Complete,
+					Completed: p.Complete.Load(),
 					Priority:  priority,
 				}
 			}
 		}
 	}
+	c.muReaders.RUnlock()
 
 	readersState := make([]*state.ReaderState, 0)
 
@@ -233,12 +246,12 @@ func (c *Cache) GetState() *state.CacheState {
 // Prevents micro-stutters at cache boundary by keeping piece priorities aligned
 // with the reader position without waiting for the 1-second cleanup throttle.
 func (c *Cache) refreshPriorities() {
-	if c.isClosed || c.torrent == nil {
+	if c.isClosed.Load() {
 		return
 	}
 	ranges := make([]Range, 0)
 	c.muReaders.RLock()
-	if c.pieces == nil || c.readers == nil {
+	if c.torrent == nil || c.pieces == nil || c.readers == nil {
 		c.muReaders.RUnlock()
 		return
 	}
@@ -253,7 +266,7 @@ func (c *Cache) refreshPriorities() {
 }
 
 func (c *Cache) cleanPieces() {
-	if c.isRemove || c.isClosed {
+	if c.isRemove.Load() || c.isClosed.Load() {
 		return
 	}
 
@@ -273,10 +286,10 @@ func (c *Cache) cleanPieces() {
 	if !c.muRemove.TryLock() {
 		return
 	}
-	c.isRemove = true
+	c.isRemove.Store(true)
 	c.lastClean = now
 	defer func() {
-		c.isRemove = false
+		c.isRemove.Store(false)
 		c.muRemove.Unlock()
 	}()
 
@@ -302,7 +315,7 @@ func (c *Cache) getRemPieces() []*Piece {
 
 	ranges := make([]Range, 0)
 	c.muReaders.RLock()
-	if c.isClosed || c.pieces == nil || c.readers == nil {
+	if c.isClosed.Load() || c.pieces == nil || c.readers == nil {
 		c.muReaders.RUnlock()
 		return nil
 	}
@@ -411,7 +424,7 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 		limit := 0
 		c.muPriority.Lock()
 		for i := readerPos; i < end && i < c.pieceCount && limit < count; i++ {
-			if !c.pieces[i].Complete {
+			if !c.pieces[i].Complete.Load() {
 				var prio torrenttypes.PiecePriority
 				if i == readerPos {
 					prio = torrent.PiecePriorityNow
@@ -497,7 +510,7 @@ func (c *Cache) Readers() int {
 
 func (c *Cache) CloseReader(r *Reader) {
 	c.muReaders.Lock()
-	if c.readers == nil || c.isClosed {
+	if c.readers == nil || c.isClosed.Load() {
 		c.muReaders.Unlock()
 		return
 	}
@@ -510,14 +523,8 @@ func (c *Cache) CloseReader(r *Reader) {
 }
 
 func (c *Cache) clearPriority() {
-	if c.torrent == nil {
-		return
-	}
-	// V180-Fix: Sleep REMOVED (V243). Immediate cleanup required to prevent OOM.
-	// time.Sleep(time.Second)
-
 	c.muReaders.RLock()
-	if c.isClosed || c.pieces == nil || c.readers == nil {
+	if c.isClosed.Load() || c.torrent == nil || c.pieces == nil || c.readers == nil {
 		c.muReaders.RUnlock()
 		return
 	}

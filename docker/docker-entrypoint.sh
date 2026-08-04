@@ -2,12 +2,12 @@
 set -eu
 
 CONFIG_PATH="${MKV_PROXY_CONFIG_PATH:-/config.json}"
-ROOT_PATH="${GOSTREAM_ROOT_PATH:-/usr/local}"
-SOURCE_PATH="${GOSTREAM_SOURCE_PATH:-/mnt/gostream-mkv-real}"
-MOUNT_PATH="${GOSTREAM_MOUNT_PATH:-/mnt/gostream-mkv-virtual}"
-STATE_DIR="${GOSTREAM_STATE_DIR:-$ROOT_PATH/STATE}"
-LOG_DIR="${GOSTREAM_LOG_DIR:-$ROOT_PATH/logs}"
-HOST_MOUNT_HINT="${GOSTREAM_HOST_MOUNT_HINT:-}"
+ROOT_PATH="${TIRAMISU_ROOT_PATH:-${GOSTREAM_ROOT_PATH:-/usr/local}}"
+SOURCE_PATH="${TIRAMISU_SOURCE_PATH:-${GOSTREAM_SOURCE_PATH:-/mnt/tiramisu-mkv-real}}"
+MOUNT_PATH="${TIRAMISU_MOUNT_PATH:-${GOSTREAM_MOUNT_PATH:-/mnt/tiramisu-mkv-virtual}}"
+STATE_DIR="${TIRAMISU_STATE_DIR:-${GOSTREAM_STATE_DIR:-$ROOT_PATH/STATE}}"
+LOG_DIR="${TIRAMISU_LOG_DIR:-${GOSTREAM_LOG_DIR:-$ROOT_PATH/logs}}"
+HOST_MOUNT_HINT="${TIRAMISU_HOST_MOUNT_HINT:-${GOSTREAM_HOST_MOUNT_HINT:-}}"
 
 # Fail loud (never silently degrade) when the runtime can't grant FUSE. Without
 # this check, a missing /dev/fuse or CAP_SYS_ADMIN only surfaces once gostream's
@@ -126,7 +126,7 @@ if [ ! -f "$CONFIG_PATH" ]; then
   exit 1
 fi
 
-gostream_pid=""
+tiramisu_pid=""
 
 # Relay INT/TERM to gostream and propagate its TRUE exit code — deliberately
 # NOT trapping EXIT (see below). Verified empirically (podman + tini): once a
@@ -142,12 +142,12 @@ gostream_pid=""
 shutdown() {
   trap - INT TERM
 
-  if [ -n "$gostream_pid" ] && kill -0 "$gostream_pid" 2>/dev/null; then
-    kill -TERM "$gostream_pid" 2>/dev/null || true
+  if [ -n "$tiramisu_pid" ] && kill -0 "$tiramisu_pid" 2>/dev/null; then
+    kill -TERM "$tiramisu_pid" 2>/dev/null || true
   fi
 
   set +e
-  wait ${gostream_pid:+"$gostream_pid"} 2>/dev/null
+  wait ${tiramisu_pid:+"$tiramisu_pid"} 2>/dev/null
   code=$?
   set -e
 
@@ -157,12 +157,12 @@ shutdown() {
 
 trap shutdown INT TERM
 
-echo "Starting gostream" >&2
-/usr/local/bin/gostream --path "$ROOT_PATH" "$SOURCE_PATH" "$MOUNT_PATH" &
-gostream_pid="$!"
+echo "Starting tiramisu" >&2
+/usr/local/bin/tiramisu --path "$ROOT_PATH" "$SOURCE_PATH" "$MOUNT_PATH" &
+tiramisu_pid="$!"
 
 set +e
-wait "$gostream_pid"
+wait "$tiramisu_pid"
 exit_code=$?
 set -e
 fusermount3 -uz "$MOUNT_PATH" 2>/dev/null || true
