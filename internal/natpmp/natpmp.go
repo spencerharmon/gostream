@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tiramisu/internal/config"
-	"tiramisu/internal/gostorm/settings"
-	"tiramisu/internal/gostorm/torr"
+	"gostream/internal/config"
+	"gostream/internal/gostorm/settings"
+	"gostream/internal/gostorm/torr"
 
 	natpmp "github.com/jackpal/go-nat-pmp"
 )

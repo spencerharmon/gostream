@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"tiramisu/internal/library"
-	"tiramisu/internal/prowlarr"
+	"gostream/internal/library"
+	"gostream/internal/prowlarr"
 )
 
 func TestTVClassifySeriesPackS01ToS03AndSeasonWindowOverlap(t *testing.T) {

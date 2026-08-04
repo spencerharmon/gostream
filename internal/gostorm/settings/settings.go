@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 
-	"tiramisu/internal/gostorm/log"
-	"tiramisu/internal/gostorm/settings/postgres"
+	"gostream/internal/gostorm/log"
+	"gostream/internal/gostorm/settings/postgres"
 )
 
 // Add a global lock for database operations during migration

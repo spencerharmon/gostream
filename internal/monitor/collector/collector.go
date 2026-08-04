@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"tiramisu/internal/catalog"
+	"gostream/internal/catalog"
 )
 
 const speedHistorySize = 60

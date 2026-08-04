@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"tiramisu/internal/gostorm/log"
+	"gostream/internal/gostorm/log"
 
 	bolt "go.etcd.io/bbolt"
 )

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"tiramisu/internal/catalog"
+	"gostream/internal/catalog"
 )
 
 const moviesAtHomeURL = "https://www.rottentomatoes.com/browse/movies_at_home/"

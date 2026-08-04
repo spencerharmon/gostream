@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"tiramisu/internal/monitor/collector"
+	"gostream/internal/monitor/collector"
 )
 
 //go:embed dashboard.html

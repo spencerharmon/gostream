@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"tiramisu/internal/gostorm/log"
-	"tiramisu/internal/gostorm/settings"
-	"tiramisu/internal/gostorm/web"
+	"gostream/internal/gostorm/log"
+	"gostream/internal/gostorm/settings"
+	"gostream/internal/gostorm/web"
 )
 
 func Start() {

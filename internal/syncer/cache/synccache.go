@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"tiramisu/internal/metadb"
+	"gostream/internal/metadb"
 )
 
 // SyncCacheManager manages synchronization caches.

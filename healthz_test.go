@@ -5,8 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"tiramisu/internal/config"
-	"tiramisu/internal/metadb"
+	"gostream/internal/config"
+	"gostream/internal/metadb"
 )
 
 // TestHealthzHandlerAlwaysReturns200 verifies /healthz (liveness) never

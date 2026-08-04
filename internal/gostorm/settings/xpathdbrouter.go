@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"tiramisu/internal/gostorm/log"
+	"gostream/internal/gostorm/log"
 
 	"golang.org/x/exp/slices"
 )

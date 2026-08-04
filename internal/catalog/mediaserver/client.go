@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"tiramisu/internal/catalog"
+	"gostream/internal/catalog"
 )
 
 // Client refreshes a media server library section.

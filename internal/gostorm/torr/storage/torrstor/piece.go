@@ -7,8 +7,8 @@ import (
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/storage"
 
-	"tiramisu/internal/gostorm/log"
-	"tiramisu/internal/gostorm/settings"
+	"gostream/internal/gostorm/log"
+	"gostream/internal/gostorm/settings"
 )
 
 // strictEscalationCapSeconds bounds the 30s-per-cycle escalation (see strictCycleCount) at its

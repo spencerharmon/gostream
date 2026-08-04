@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"tiramisu/internal/cache"
-	"tiramisu/internal/vfs"
+	"gostream/internal/cache"
+	"gostream/internal/vfs"
 )
 
 // StartupCacheBuilder pre-populates metadata cache at startup

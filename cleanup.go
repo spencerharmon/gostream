@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"tiramisu/internal/cache"
-	"tiramisu/internal/gostorm/native"
-	"tiramisu/internal/gostorm/torr"
-	"tiramisu/internal/preload"
+	"gostream/internal/cache"
+	"gostream/internal/gostorm/native"
+	"gostream/internal/gostorm/torr"
+	"gostream/internal/preload"
 )
 
 // CleanupManager provides periodic cleanup of various in-memory structures

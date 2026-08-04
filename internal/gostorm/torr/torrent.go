@@ -2,24 +2,24 @@ package torr
 
 import (
 	"errors"
-	"tiramisu/internal/gostorm/torrshash"
+	"gostream/internal/gostorm/torrshash"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	utils2 "tiramisu/internal/gostorm/utils"
+	utils2 "gostream/internal/gostorm/utils"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 
-	"tiramisu/internal/gostorm/log"
-	"tiramisu/internal/gostorm/settings"
-	"tiramisu/internal/gostorm/torr/state"
-	cacheSt "tiramisu/internal/gostorm/torr/storage/state"
-	"tiramisu/internal/gostorm/torr/storage/torrstor"
-	"tiramisu/internal/gostorm/torr/utils"
+	"gostream/internal/gostorm/log"
+	"gostream/internal/gostorm/settings"
+	"gostream/internal/gostorm/torr/state"
+	cacheSt "gostream/internal/gostorm/torr/storage/state"
+	"gostream/internal/gostorm/torr/storage/torrstor"
+	"gostream/internal/gostorm/torr/utils"
 )
 
 type Torrent struct {

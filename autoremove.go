@@ -11,8 +11,8 @@ import (
 	"regexp"
 	"strings"
 
-	"tiramisu/internal/gostorm/native"
-	"tiramisu/internal/vfs"
+	"gostream/internal/gostorm/native"
+	"gostream/internal/vfs"
 )
 
 // TorrentRemover handles automatic torrent removal from GoStorm

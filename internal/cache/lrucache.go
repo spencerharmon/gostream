@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash/v2"
-	"tiramisu/internal/vfs"
+	"gostream/internal/vfs"
 )
 
 // ShardedLRUCache Wrapper per ridurre la contesa sui lock (V231-Fix)

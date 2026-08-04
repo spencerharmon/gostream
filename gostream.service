@@ -1,10 +1,7 @@
 [Unit]
-Description=Tiramisu Unified Engine (GoStorm + FUSE Proxy)
+Description=GoStream Unified Engine (GoStorm + FUSE Proxy)
 After=network-online.target systemd-resolved.service nss-lookup.target local-fs.target remote-fs.target
 Wants=network-online.target
-# Optional: uncomment if using AI Pilot (ensures ai-server loads before tiramisu)
-# After=network-online.target systemd-resolved.service nss-lookup.target local-fs.target remote-fs.target ai-server.service
-# Wants=network-online.target ai-server.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -17,9 +14,9 @@ Type=simple
 User=YOUR_USER
 Group=YOUR_GROUP
 
-# Change to your Tiramisu install directory.
+# Change to your GoStream install directory. 
 # All other paths (logs, state, scripts) will be relative to this.
-WorkingDirectory=/home/pi/Tiramisu
+WorkingDirectory=/home/pi/GoStream
 
 # Wait for DNS before starting (required for tracker resolution)
 ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5; do nslookup www.google.com >/dev/null 2>&1 && exit 0 || sleep 2; done; exit 1'
@@ -29,9 +26,9 @@ ExecStartPre=-/usr/bin/fusermount -uz /mnt/torrserver-go
 ExecStartPre=/bin/mkdir -p /mnt/torrserver-go
 
 # V1.4.6: Main binary — using --path . for true portability (STATE stays in WorkingDirectory)
-ExecStart=./tiramisu --path .
+ExecStart=./gostream --path .
 
-# Restart Samba after tiramisu starts (required for FUSE-backed shares)
+# Restart Samba after gostream starts (required for FUSE-backed shares)
 ExecStartPost=/bin/sleep 2
 ExecStartPost=/usr/bin/sudo /bin/systemctl restart smbd
 
@@ -43,9 +40,9 @@ RestartSec=10
 LimitNOFILE=65536
 LimitNPROC=4096
 
-# V1.4.6: Centralized logging inside the Tiramisu directory (relative to WorkingDirectory)
-StandardOutput=append:logs/tiramisu.log
-StandardError=append:logs/tiramisu.log
+# V1.4.6: Centralized logging inside the GoStream directory (relative to WorkingDirectory)
+StandardOutput=append:logs/gostream.log
+StandardError=append:logs/gostream.log
 
 [Install]
 WantedBy=multi-user.target

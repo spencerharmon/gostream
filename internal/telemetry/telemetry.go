@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"time"
 
-	"tiramisu/internal/config"
+	"gostream/internal/config"
 )
 
 // SendHeartbeat sends an anonymous heartbeat to the telemetry server.

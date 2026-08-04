@@ -17,13 +17,13 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"tiramisu/internal/catalog"
-	"tiramisu/internal/catalog/rottentomatoes"
-	"tiramisu/internal/catalog/tmdb"
-	"tiramisu/internal/catalog/torrentio"
-	"tiramisu/internal/config"
-	"tiramisu/internal/library"
-	"tiramisu/internal/prowlarr"
+	"gostream/internal/catalog"
+	"gostream/internal/catalog/rottentomatoes"
+	"gostream/internal/catalog/tmdb"
+	"gostream/internal/catalog/torrentio"
+	"gostream/internal/config"
+	"gostream/internal/library"
+	"gostream/internal/prowlarr"
 )
 
 // MovieGoEngine is the pure Go implementation of movie sync.

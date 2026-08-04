@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"tiramisu/internal/catalog"
+	"gostream/internal/catalog"
 )
 
 // Client queries the Prowlarr API and returns results in Stremio/Torrentio format.

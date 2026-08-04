@@ -14,9 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tiramisu/internal/gostorm/settings"
-	"tiramisu/internal/gostorm/torr"
-	"tiramisu/internal/gostorm/torr/state"
+	"gostream/internal/gostorm/settings"
+	"gostream/internal/gostorm/torr"
+	"gostream/internal/gostorm/torr/state"
 )
 
 var aiDisabled atomic.Bool

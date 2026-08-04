@@ -2,13 +2,13 @@ package config
 
 import (
 	"encoding/json"
+	"gostream/internal/prowlarr"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
-	"tiramisu/internal/prowlarr"
 
 	"github.com/google/uuid"
 )

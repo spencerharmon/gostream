@@ -1,4 +1,4 @@
-module tiramisu
+module gostream
 
 go 1.24.0
 

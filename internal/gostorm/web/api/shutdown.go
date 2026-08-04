@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	sets "tiramisu/internal/gostorm/settings"
-	"tiramisu/internal/gostorm/torr"
+	sets "gostream/internal/gostorm/settings"
+	"gostream/internal/gostorm/torr"
 
 	"github.com/gin-gonic/gin"
 )

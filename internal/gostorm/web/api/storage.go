@@ -3,7 +3,7 @@ package api
 import (
 	"net/http"
 
-	sets "tiramisu/internal/gostorm/settings"
+	sets "gostream/internal/gostorm/settings"
 
 	"github.com/gin-gonic/gin"
 )

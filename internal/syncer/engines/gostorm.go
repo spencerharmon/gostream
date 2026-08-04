@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"tiramisu/internal/catalog"
-	"tiramisu/internal/library"
+	"gostream/internal/catalog"
+	"gostream/internal/library"
 )
 
 // GoStormClient handles HTTP operations with the GoStorm engine.

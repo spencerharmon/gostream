@@ -1,7 +1,7 @@
 package api
 
 import (
-	"tiramisu/internal/gostorm/web/auth"
+	"gostream/internal/gostorm/web/auth"
 
 	"github.com/gin-gonic/gin"
 )

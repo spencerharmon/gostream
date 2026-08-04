@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"tiramisu/internal/gostorm/log"
-	"tiramisu/internal/gostorm/settings"
+	"gostream/internal/gostorm/log"
+	"gostream/internal/gostorm/settings"
 
 	"github.com/gin-gonic/gin"
 )

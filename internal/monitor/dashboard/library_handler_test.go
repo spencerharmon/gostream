@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"tiramisu/internal/library"
+	"gostream/internal/library"
 )
 
 type fakeGoStorm struct {

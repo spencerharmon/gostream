@@ -10,7 +10,7 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"tiramisu/internal/catalog"
+	"gostream/internal/catalog"
 )
 
 const baseURL = "https://api.themoviedb.org/3"
