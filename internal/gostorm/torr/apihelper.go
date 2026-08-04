@@ -2,7 +2,6 @@ package torr
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -10,10 +9,11 @@ import (
 	"time"
 
 	"github.com/anacrolix/torrent"
+	"github.com/anacrolix/torrent/iplist"
 	"github.com/anacrolix/torrent/metainfo"
 
-	"gostream/internal/gostorm/log"
-	sets "gostream/internal/gostorm/settings"
+	"tiramisu/internal/gostorm/log"
+	sets "tiramisu/internal/gostorm/settings"
 )
 
 // saveDebounce prevents redundant BoltDB writes for the same torrent.
@@ -32,27 +32,6 @@ func InitApiHelper(bt *BTServer) {
 	btsMu.Lock()
 	defer btsMu.Unlock()
 	bts = bt
-}
-
-func LoadTorrent(tor *Torrent) *Torrent {
-	if tor.TorrentSpec == nil {
-		return nil
-	}
-	btsMu.RLock()
-	localBts := bts
-	btsMu.RUnlock()
-
-	tr, err := NewTorrent(tor.TorrentSpec, localBts)
-	if err != nil {
-		return nil
-	}
-	if !tr.WaitInfo() {
-		return nil
-	}
-	tr.Title = tor.Title
-	tr.Poster = tor.Poster
-	tr.Data = tor.Data
-	return tr
 }
 
 func AddTorrent(spec *torrent.TorrentSpec, title, poster string, data string, category string) (*Torrent, error) {
@@ -168,6 +147,10 @@ func PeekTorrent(hashHex string) *Torrent {
 	btsMu.RLock()
 	defer btsMu.RUnlock()
 
+	if bts == nil {
+		return nil
+	}
+
 	hash := metainfo.NewHashFromHex(hashHex)
 	tor := bts.GetTorrent(hash)
 	if tor != nil {
@@ -198,6 +181,11 @@ func GetTorrent(hashHex string) *Torrent {
 	if tr != nil {
 		tor = tr
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.TLogln("[PANIC] NewTorrent goroutine recovered:", r)
+				}
+			}()
 			log.TLogln("New torrent", tor.Hash())
 
 			btsMu.RLock()
@@ -266,6 +254,16 @@ func SetTorrent(hashHex, title, poster, category string, data string) *Torrent {
 	}
 }
 
+// SetIPBlocklist live-swaps the running BT engine's blocklist. No-op if the engine
+// hasn't connected yet.
+func SetIPBlocklist(list iplist.Ranger) {
+	btsMu.RLock()
+	defer btsMu.RUnlock()
+	if bts != nil {
+		bts.SetIPBlocklist(list)
+	}
+}
+
 func RemTorrent(hashHex string) {
 	if sets.ReadOnly {
 		log.TLogln("API RemTorrent: Read-only DB mode!", hashHex)
@@ -322,10 +320,20 @@ func ListTorrent() []*Torrent {
 	return ret
 }
 
+// V304BannedCount returns the number of currently banned peer IPs, including bans restored
+// from persisted state at startup (not just ones applied since this process started).
+func V304BannedCount() int {
+	return torrent.V304BannedCount()
+}
+
 func ListActiveTorrent() []*Torrent {
 	btsMu.RLock()
 	localBts := bts
 	btsMu.RUnlock()
+
+	if localBts == nil {
+		return nil
+	}
 
 	btlist := localBts.ListTorrents()
 	var ret []*Torrent
@@ -430,12 +438,6 @@ func Shutdown() {
 	sets.CloseDB()
 	log.TLogln("Received shutdown. Quit")
 	os.Exit(0)
-}
-
-func WriteStatus(w io.Writer) {
-	btsMu.RLock()
-	defer btsMu.RUnlock()
-	bts.client.WriteStatus(w)
 }
 
 func Preload(torr *Torrent, index int) {

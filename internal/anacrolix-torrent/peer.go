@@ -13,7 +13,6 @@ import (
 	"github.com/anacrolix/chansync"
 	. "github.com/anacrolix/generics"
 	"github.com/anacrolix/log"
-	"github.com/anacrolix/missinggo/iter"
 	"github.com/anacrolix/missinggo/v2/bitmap"
 	"github.com/anacrolix/multiless"
 
@@ -55,6 +54,13 @@ type (
 		completedHandshake      time.Time
 		lastUsefulChunkReceived time.Time
 		lastChunkSent           time.Time
+
+		// Recent-throughput EWMA for outlier ejection (see maybeEjectOutlierPeer); unlike
+		// downloadRate()'s lifetime average, this reflects current behavior. Guarded by t.cl's lock.
+		ewmaRate         float64
+		ewmaSeeded       bool // false until first sample - distinguishes "no data" from a real zero rate
+		ewmaLastBytes    int64
+		ewmaLastSampleAt time.Time
 
 		// Stuff controlled by the local peer.
 		needRequestUpdate    string
@@ -168,10 +174,6 @@ func (cn *Peer) expectingChunks() bool {
 		return !haveAllowedFastRequests
 	})
 	return haveAllowedFastRequests
-}
-
-func (cn *Peer) remoteChokingPiece(piece pieceIndex) bool {
-	return cn.peerChoking && !cn.peerAllowedFast.Contains(piece)
 }
 
 func (cn *Peer) cumInterest() time.Duration {
@@ -462,14 +464,6 @@ func (cn *Peer) shouldRequest(r RequestIndex) error {
 	return nil
 }
 
-func (cn *Peer) mustRequest(r RequestIndex) bool {
-	more, err := cn.request(r)
-	if err != nil {
-		panic(err)
-	}
-	return more
-}
-
 func (cn *Peer) request(r RequestIndex) (more bool, err error) {
 	if err := cn.shouldRequest(r); err != nil {
 		panic(err)
@@ -520,29 +514,6 @@ func (cn *Peer) updateRequests(reason string) {
 	}
 	cn.needRequestUpdate = reason
 	cn.handleUpdateRequests()
-}
-
-// Emits the indices in the Bitmaps bms in order, never repeating any index.
-// skip is mutated during execution, and its initial values will never be
-// emitted.
-func iterBitmapsDistinct(skip *bitmap.Bitmap, bms ...bitmap.Bitmap) iter.Func {
-	return func(cb iter.Callback) {
-		for _, bm := range bms {
-			if !iter.All(
-				func(_i interface{}) bool {
-					i := _i.(int)
-					if skip.Contains(bitmap.BitIndex(i)) {
-						return true
-					}
-					skip.Add(bitmap.BitIndex(i))
-					return cb(i)
-				},
-				bm.Iter,
-			) {
-				return
-			}
-		}
-	}
 }
 
 // After handshake, we know what Torrent and Client stats to include for a
@@ -669,6 +640,21 @@ func (c *Peer) receiveChunk(msg *pp.Message) error {
 				f(PeerMessageEvent{c, msg})
 			}
 		}
+		// Tail-hedging (Task 4): capture the send timestamp before deleteRequest wipes
+		// t.requestState[req] - while a warmup fetch OR playback-pressure hedge window is active.
+		// Without the playbackPressureActive arm, resumed torrents (warmupActive never set) never
+		// record a single latency sample, so checkAndFireHedges' generalized hedge permanently
+		// falls back to hedgeNoBaselineCeiling instead of a real p95 - samples recorded here feed
+		// the same per-size warmupLatencySamples ring warmupP95 reads regardless of which phase
+		// triggered the request, so both phases benefit once either has real data.
+		var warmupReqSentAt time.Time
+		recordWarmupLatencySample := false
+		if t.warmupActive.Load() || t.playbackPressureActive.Load() {
+			if rs, ok := t.requestState[req]; ok {
+				warmupReqSentAt = rs.when
+				recordWarmupLatencySample = true
+			}
+		}
 		// Request has been satisfied.
 		if c.deleteRequest(req) || c.requestState.Cancelled.CheckedRemove(req) {
 			intended = true
@@ -680,6 +666,9 @@ func (c *Peer) receiveChunk(msg *pp.Message) error {
 			}
 		} else {
 			chunksReceived.Add("unintended", 1)
+		}
+		if recordWarmupLatencySample {
+			t.recordWarmupLatency(int64(len(msg.Piece)), time.Since(warmupReqSentAt))
 		}
 	}
 
@@ -807,6 +796,7 @@ func (c *Peer) deleteRequest(r RequestIndex) bool {
 		panic("only one peer should have a given request at a time")
 	}
 	delete(c.t.requestState, r)
+	delete(c.t.hedgedRequests, r) // Task 4: allow this request index to be hedged again if it recurs
 	// c.t.iterPeers(func(p *Peer) {
 	// 	if p.isLowOnRequests() {
 	// 		p.updateRequests("Peer.deleteRequest")

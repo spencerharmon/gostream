@@ -2,7 +2,6 @@ package registry
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -10,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"gostream/internal/metadb"
+	"tiramisu/internal/metadb"
 )
 
 var logger = log.New(os.Stdout, "[Registry] ", log.LstdFlags)
@@ -239,10 +238,6 @@ func saveRegistryLocked(path string, registry map[string]EpisodeEntry) error {
 	}
 	_, err = f.Write(data)
 	return err
-}
-
-func readFileSafe(path string) ([]byte, error) {
-	return ioutil.ReadFile(path)
 }
 
 func unmarshalJSON(data []byte, target interface{}) error {

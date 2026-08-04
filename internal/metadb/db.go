@@ -14,7 +14,7 @@ type Logger interface {
 	Printf(format string, v ...interface{})
 }
 
-// DB wraps a SQLite database connection for gostream state persistence.
+// DB wraps a SQLite database connection for tiramisu state persistence.
 type DB struct {
 	db     *sql.DB
 	path   string
@@ -143,6 +143,11 @@ CREATE TABLE IF NOT EXISTS playback_states (
 );
 CREATE INDEX IF NOT EXISTS idx_playback_hash ON playback_states(hash);
 CREATE INDEX IF NOT EXISTS idx_playback_healthy ON playback_states(is_healthy);
+
+CREATE TABLE IF NOT EXISTS v304_bans (
+    ip        TEXT PRIMARY KEY,
+    banned_at INTEGER NOT NULL
+);
 `
 	_, err := d.db.Exec(schema)
 	if err != nil {
@@ -152,5 +157,6 @@ CREATE INDEX IF NOT EXISTS idx_playback_healthy ON playback_states(is_healthy);
 	// V750: Register schema versions
 	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (1, 'initial schema')`)
 	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (2, 'add playback_states table')`)
+	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (3, 'add v304_bans table')`)
 	return nil
 }

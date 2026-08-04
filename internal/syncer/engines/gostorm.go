@@ -14,7 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"gostream/internal/library"
+	"tiramisu/internal/catalog"
+	"tiramisu/internal/library"
 )
 
 // GoStormClient handles HTTP operations with the GoStorm engine.
@@ -199,7 +200,7 @@ func (c *GoStormClient) ProbeAudio(ctx context.Context, hash string, fileID int,
 // ListTorrents returns all active torrents.
 func (c *GoStormClient) ListTorrents(ctx context.Context) ([]TorrentStats, error) {
 	body := map[string]string{"action": "list"}
-	data, err := c.doTorrents(ctx, body)
+	data, err := c.doTorrents(ctx, body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +214,7 @@ func (c *GoStormClient) ListTorrents(ctx context.Context) ([]TorrentStats, error
 
 func (c *GoStormClient) getTorrent(ctx context.Context, hash string) (*TorrentStats, error) {
 	body := map[string]string{"action": "get", "hash": hash}
-	data, err := c.doTorrents(ctx, body)
+	data, err := c.doTorrents(ctx, body, false)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +226,13 @@ func (c *GoStormClient) getTorrent(ctx context.Context, hash string) (*TorrentSt
 	return &info, nil
 }
 
-func (c *GoStormClient) doTorrents(ctx context.Context, body map[string]string) ([]byte, error) {
+// doTorrents posts a JSON action body to GoStorm's /torrents endpoint. retry controls
+// whether transient failures are retried (catalog.Do) - true for ListTorrents (a standalone
+// read with no other retry mechanism around it), false for getTorrent (already wrapped in
+// GetTorrentInfo's own outer polling/backoff loop - stacking catalog.Do's retry inside it
+// would waste that loop's time budget for no benefit) and for mutations (add/rem), so a
+// mutation that already succeeded server-side is never silently duplicated by a retry.
+func (c *GoStormClient) doTorrents(ctx context.Context, body map[string]string, retry bool) ([]byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -237,7 +244,12 @@ func (c *GoStormClient) doTorrents(ctx context.Context, body map[string]string) 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	var resp *http.Response
+	if retry {
+		resp, err = catalog.Do(ctx, c.httpClient, req)
+	} else {
+		resp, err = c.httpClient.Do(req)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +263,7 @@ func (c *GoStormClient) doTorrents(ctx context.Context, body map[string]string) 
 }
 
 func (c *GoStormClient) postTorrents(ctx context.Context, body map[string]string) error {
-	_, err := c.doTorrents(ctx, body)
+	_, err := c.doTorrents(ctx, body, false)
 	return err
 }
 

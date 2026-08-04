@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"gostream/internal/config"
-	"gostream/internal/persist"
-	"gostream/internal/warmup"
+	"tiramisu/internal/config"
+	"tiramisu/internal/persist"
+	"tiramisu/internal/warmup"
 )
 
 // PrestageProgress is the public progress record for an in-flight or

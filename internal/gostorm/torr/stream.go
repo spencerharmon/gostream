@@ -15,10 +15,10 @@ import (
 	"github.com/anacrolix/missinggo/v2/httptoo"
 	"github.com/anacrolix/torrent"
 
-	mt "gostream/internal/gostorm/mimetype"
-	sets "gostream/internal/gostorm/settings"
-	"gostream/internal/gostorm/torr/state"
-	"gostream/internal/gostorm/torr/storage/torrstor"
+	mt "tiramisu/internal/gostorm/mimetype"
+	sets "tiramisu/internal/gostorm/settings"
+	"tiramisu/internal/gostorm/torr/state"
+	"tiramisu/internal/gostorm/torr/storage/torrstor"
 )
 
 // Add atomic counter for concurrent streams
@@ -39,12 +39,32 @@ func (w *contextResponseWriter) Write(p []byte) (n int, err error) {
 	}
 }
 
+// ctxReader binds a context to torrstor.Reader's blocking Read, so http.ServeContent's internal
+// reads are bounded by the stream timeout instead of blocking forever on a stalled swarm (Read()
+// alone calls context.Background(), which never unblocks on a piece that never arrives).
+type ctxReader struct {
+	*torrstor.Reader
+	ctx context.Context
+}
+
+func (r *ctxReader) Read(p []byte) (int, error) {
+	return r.Reader.ReadContext(r.ctx, p)
+}
+
 func (t *Torrent) Stream(fileID int, req *http.Request, resp http.ResponseWriter) error {
 	// Increment active streams counter
 	streamID := atomic.AddInt32(&activeStreams, 1)
 	defer atomic.AddInt32(&activeStreams, -1)
 	// Stream disconnect timeout (same as torrent)
 	streamTimeout := sets.BTsets.TorrentDisconnectTimeout
+	// V800: In STRICT mode (non-responsive), pieces must complete SHA-1 verification before serving.
+	// This takes longer than responsive (per-chunk) mode, so the fixed 15-30s absolute timeout
+	// expires mid-piece on slow swarms, killing the stream and forcing reconnect thrashing.
+	// Doubling the timeout for STRICT mode gives pieces enough time to complete without affecting
+	// TorrentDisconnectTimeout's use elsewhere (torrent expiry, idle detection, AI Tuner).
+	if !torrstor.IsResponsive() {
+		streamTimeout *= 2
+	}
 
 	if !t.GotInfo() {
 		http.NotFound(resp, req)
@@ -148,7 +168,7 @@ func (t *Torrent) Stream(fileID int, req *http.Request, resp http.ResponseWriter
 		ResponseWriter: resp,
 		ctx:            ctx,
 	}
-	http.ServeContent(wrappedResp, req, file.Path(), time.Unix(t.Timestamp, 0), reader)
+	http.ServeContent(wrappedResp, req, file.Path(), time.Unix(t.Timestamp, 0), &ctxReader{Reader: reader, ctx: ctx})
 
 	if sets.BTsets.EnableDebug {
 		if clerr != nil {
@@ -158,9 +178,4 @@ func (t *Torrent) Stream(fileID int, req *http.Request, resp http.ResponseWriter
 		}
 	}
 	return nil
-}
-
-// GetActiveStreams returns number of currently active streams
-func GetActiveStreams() int32 {
-	return atomic.LoadInt32(&activeStreams)
 }

@@ -71,6 +71,7 @@ type Client struct {
 	listeners      []Listener
 	dhtServers     []DhtServer
 	ipBlockList    iplist.Ranger
+	dhtIPBlocklist *swappableIPBlocklist
 
 	// Set of addresses that have our client ID. This intentionally will
 	// include ourselves if we end up trying to connect to our own address
@@ -204,6 +205,7 @@ func (cl *Client) init(cfg *ClientConfig) {
 	cl.activeAnnounceLimiter.SlotsPerKey = 2
 	cl.event.L = cl.locker()
 	cl.ipBlockList = cfg.IPBlocklist
+	cl.dhtIPBlocklist = newSwappableIPBlocklist(cfg.IPBlocklist)
 	cl.httpClient = &http.Client{
 		Transport: cfg.WebTransport,
 	}
@@ -407,7 +409,7 @@ func (cl *Client) listenNetworks() (ns []network) {
 func (cl *Client) NewAnacrolixDhtServer(conn net.PacketConn) (s *dht.Server, err error) {
 	logger := cl.logger.WithNames("dht", conn.LocalAddr().String())
 	cfg := dht.ServerConfig{
-		IPBlocklist:    cl.ipBlockList,
+		IPBlocklist:    cl.dhtIPBlocklist,
 		Conn:           conn,
 		OnAnnouncePeer: cl.onDHTAnnouncePeer,
 		PublicIP: func() net.IP {
@@ -458,6 +460,60 @@ func (cl *Client) Close() (errs []error) {
 	cl.event.Broadcast()
 	closeGroup.Wait() // defer is LIFO. We want to Wait() after cl.unlock()
 	return
+}
+
+// SetIPBlocklist live-swaps the blocklist consulted by ipBlockRange, so a background
+// refresh takes effect immediately instead of only on the next restart. Also updates
+// dhtIPBlocklist, the wrapper handed to already-constructed dht.Server instances at
+// NewAnacrolixDhtServer time - dht.Server keeps whatever iplist.Ranger it was given at
+// construction and has no setter of its own, so without this indirection a live-reload
+// would only ever reach new peer connections, never DHT routing.
+func (cl *Client) SetIPBlocklist(list iplist.Ranger) {
+	cl.lock()
+	defer cl.unlock()
+	cl.ipBlockList = list
+	if cl.dhtIPBlocklist != nil {
+		cl.dhtIPBlocklist.set(list)
+	}
+}
+
+// swappableIPBlocklist implements iplist.Ranger by delegating to an inner Ranger that
+// can be swapped after construction. dht.Server stores whatever iplist.Ranger it's given
+// as an interface value and never re-reads it from the Client, so handing it this wrapper
+// (instead of a raw snapshot) lets SetIPBlocklist's live-reload reach it after the fact.
+type swappableIPBlocklist struct {
+	mu    sync.RWMutex
+	inner iplist.Ranger
+}
+
+func newSwappableIPBlocklist(initial iplist.Ranger) *swappableIPBlocklist {
+	return &swappableIPBlocklist{inner: initial}
+}
+
+func (w *swappableIPBlocklist) set(list iplist.Ranger) {
+	w.mu.Lock()
+	w.inner = list
+	w.mu.Unlock()
+}
+
+func (w *swappableIPBlocklist) Lookup(ip net.IP) (r iplist.Range, ok bool) {
+	w.mu.RLock()
+	inner := w.inner
+	w.mu.RUnlock()
+	if inner == nil {
+		return
+	}
+	return inner.Lookup(ip)
+}
+
+func (w *swappableIPBlocklist) NumRanges() int {
+	w.mu.RLock()
+	inner := w.inner
+	w.mu.RUnlock()
+	if inner == nil {
+		return 0
+	}
+	return inner.NumRanges()
 }
 
 func (cl *Client) ipBlockRange(ip net.IP) (r iplist.Range, blocked bool) {
@@ -640,23 +696,6 @@ func (cl *Client) dopplegangerAddr(addr string) bool {
 	return ok
 }
 
-// Returns a connection over UTP or TCP, whichever is first to connect.
-func (cl *Client) dialFirst(ctx context.Context, addr string) (res DialResult) {
-	return DialFirst(ctx, addr, cl.dialers)
-}
-
-// Returns a connection over UTP or TCP, whichever is first to connect.
-func DialFirst(ctx context.Context, addr string, dialers []Dialer) (res DialResult) {
-	pool := dialPool{
-		addr: addr,
-	}
-	defer pool.startDrainer()
-	for _, _s := range dialers {
-		pool.add(ctx, _s)
-	}
-	return pool.getFirst()
-}
-
 func dialFromSocket(ctx context.Context, s Dialer, addr string) net.Conn {
 	c, err := s.Dial(ctx, addr)
 	if err != nil {
@@ -685,13 +724,6 @@ func (cl *Client) noLongerHalfOpen(t *Torrent, addr string, attemptKey outgoingC
 	for _, t := range cl.torrents {
 		t.openNewConns()
 	}
-}
-
-func (cl *Client) countHalfOpenFromTorrents() (count int) {
-	for _, t := range cl.torrents {
-		count += t.numHalfOpenAttempts()
-	}
-	return
 }
 
 // Performs initiator handshakes and returns a connection. Returns nil *PeerConn if no connection
@@ -1098,11 +1130,89 @@ func (t *Torrent) runHandshookConn(pc *PeerConn) error {
 	pc.startMessageWriter()
 	pc.sendInitialMessages()
 	pc.initUpdateRequestsTimer()
+	if cl.config.AggressivePeerManagement && t.warmupActive.Load() {
+		go t.churnIfUselessForWarmup(pc)
+	}
 	err := pc.mainReadLoop()
 	if err != nil {
 		return fmt.Errorf("main read loop: %w", err)
 	}
 	return nil
+}
+
+// churnIfUselessForWarmup gives a newly-connected peer a short window to report pieces near the
+// start of the file actually being warmed (per t.warmupFileID) via its bitfield/have messages
+// (arriving concurrently through pc.mainReadLoop). If after that window the peer has none of the
+// first pieces of THAT FILE's own piece range (not necessarily piece 0 of the torrent - a
+// multi-file torrent's warmed file may start well past piece 0), disconnect it immediately
+// instead of holding the connection slot - treats new connections as disposable probes during the
+// warmup window only, mapping which peers are actually useful far faster than waiting for default
+// PEX gossip pacing to settle naturally. Only spawned when AggressivePeerManagement is on and the
+// torrent has an in-flight DiskWarmup fetch (t.warmupActive, set externally by the GoStorm layer
+// via Torrent.SetWarmupActive).
+func (t *Torrent) churnIfUselessForWarmup(pc *PeerConn) {
+	const (
+		probeWindow = 3 * time.Second
+		// Matches hedgeWarmupPieceWindow (the hedge's own probe of the same warmed file) instead
+		// of a much narrower window - a peer holding pieces 4-32 of the head is still useful to
+		// the 64MB head warmup and shouldn't be churned just because churn used to check fewer
+		// pieces than the hedge logic checks on the very same file.
+		probePieces = hedgeWarmupPieceWindow
+		// 10s produced too many wasted re-probes in production (57% of all churn events over
+		// 10 days were repeat drops of a peer that had just been churned) - a peer that lacked
+		// the warmup-region pieces 10s ago is very unlikely to have them now. Raised to 30s.
+		churnCooldownDur = 30 * time.Second
+	)
+	key := churnCooldownKey(pc.RemoteAddr)
+
+	t.cl.lock()
+	now := time.Now()
+	// giveSecondChance: this reconnect landed on an existing, still-valid cooldown entry that
+	// hasn't used its one second-chance probe yet - a peer's first drop can be a slow bitfield
+	// (arrived just after the 3s window closed) rather than genuine uselessness, so give it one
+	// more full probe before trusting the verdict. entry.probed==true means that second chance
+	// was already spent and failed again; only then do we drop without probing.
+	giveSecondChance := false
+	if entry, ok := t.churnCooldown[key]; ok {
+		if now.Before(entry.until) {
+			if entry.probed {
+				t.logger.WithDefaultLevel(log.Warning).Printf("[PEXChurn] hash=%s dropping peer %v - still in %v cooldown after its second-chance probe also failed", t.infoHash.HexString(), pc.RemoteAddr, churnCooldownDur)
+				pc.drop()
+				t.cl.unlock()
+				return
+			}
+			giveSecondChance = true
+		} else {
+			// Expired - opportunistic cleanup so churnCooldown doesn't grow unbounded over a
+			// long-lived torrent's many warmup cycles (seeks each set warmupActive true again).
+			delete(t.churnCooldown, key)
+		}
+	}
+	t.cl.unlock()
+
+	time.Sleep(probeWindow)
+	t.cl.lock()
+	defer t.cl.unlock()
+	if pc.closed.IsSet() || !t.warmupActive.Load() {
+		return // already gone, or warmup finished while we were waiting - nothing to churn
+	}
+	begin, end, ok := t.warmupPieceRange(probePieces)
+	if !ok {
+		// Metadata not resolved yet, or file index out of range - can't compute a real piece
+		// range. Keep the connection; safe default (never drop without positive evidence).
+		return
+	}
+	for i := begin; i < end; i++ {
+		if pc.peerHasPiece(i) {
+			return // has something relevant to the warmup region, keep the connection
+		}
+	}
+	t.logger.WithDefaultLevel(log.Warning).Printf("[PEXChurn] hash=%s dropping peer %v - no warmup-region pieces (file range [%d,%d)) after %v probe", t.infoHash.HexString(), pc.RemoteAddr, begin, end, probeWindow)
+	if t.churnCooldown == nil {
+		t.churnCooldown = make(map[string]churnCooldownEntry)
+	}
+	t.churnCooldown[key] = churnCooldownEntry{until: time.Now().Add(churnCooldownDur), probed: giveSecondChance}
+	pc.drop()
 }
 
 func (p *Peer) initUpdateRequestsTimer() {
@@ -1316,6 +1426,7 @@ func (cl *Client) newTorrentOpt(opts AddTorrentOpts) (t *Torrent) {
 		webSeeds:     make(map[string]*Peer),
 		gotMetainfoC: make(chan struct{}),
 	}
+	t.closedCtx, t.closedCtxCancel = context.WithCancel(context.Background())
 	var salt [8]byte
 	rand.Read(salt[:])
 	t.smartBanCache.Hash = func(b []byte) uint64 {
@@ -1662,14 +1773,6 @@ func firstNotNil(ips ...net.IP) net.IP {
 		}
 	}
 	return nil
-}
-
-func (cl *Client) eachListener(f func(Listener) bool) {
-	for _, s := range cl.listeners {
-		if !f(s) {
-			break
-		}
-	}
 }
 
 func (cl *Client) findListener(f func(Listener) bool) (ret Listener) {

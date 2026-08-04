@@ -1,7 +1,8 @@
-// Bolt piece completion is not available, and neither is sqlite.
-//go:build (!cgo || nosqlite) && (noboltdb || wasm)
+// Bolt piece completion support was removed upstream (dead-code cleanup); this
+// is now the sole fallback whenever sqlite's cgo-backed completion isn't
+// usable — regardless of the now-vestigial noboltdb/wasm build tags.
+//go:build !cgo || nosqlite
 // +build !cgo nosqlite
-// +build noboltdb wasm
 
 package storage
 

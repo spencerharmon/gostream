@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"tiramisu/internal/catalog"
 )
 
 // Client queries the Prowlarr API and returns results in Stremio/Torrentio format.
@@ -42,20 +44,24 @@ func NewClient(cfg ConfigProwlarr) *Client {
 
 // FetchTorrents queries Prowlarr and returns Stremio-format streams.
 // contentType is "movie" or "series". title is the show/movie name.
+// year is the release year and is only used as a keyword-search qualifier for movies
+// (a series' year reflects season 1's air date, not later seasons, so it isn't used there).
 // seasons is optional and used for series keyword search (e.g. "title s01").
 // Returns an empty slice (never nil) if disabled or on error.
-func (c *Client) FetchTorrents(imdbID, contentType, title string, seasons ...int) []Stream {
+func (c *Client) FetchTorrents(imdbID, contentType, title string, year int, seasons ...int) []Stream {
 	if c == nil {
 		return []Stream{}
 	}
-	results := c.fetchFromProwlarr(imdbID, contentType, title, seasons...)
+	results := c.fetchFromProwlarr(imdbID, contentType, title, year, seasons...)
 	return c.mapToStremioFormat(results)
 }
 
 // fetchFromProwlarr executes an API query using the IMDb ID and merges results by infoHash.
 // If contentType is "series" and seasons are provided, it also executes keyword searches
-// (e.g., "Show Name s01") in parallel to maximize discovery of 4K releases.
-func (c *Client) fetchFromProwlarr(imdbID, contentType, title string, seasons ...int) []ProwlarrResult {
+// (e.g., "Show Name s01") in parallel to maximize discovery of 4K releases. For movies, a
+// single "Title Year" keyword query is added (e.g. "Gone 2026"), since indexers without
+// IMDb-ID search (1337x, etc.) otherwise never contribute movie results at all.
+func (c *Client) fetchFromProwlarr(imdbID, contentType, title string, year int, seasons ...int) []ProwlarrResult {
 	prowlarrType := "movie"
 	if contentType == "series" {
 		prowlarrType = "tvsearch"
@@ -88,6 +94,16 @@ func (c *Client) fetchFromProwlarr(imdbID, contentType, title string, seasons ..
 				"query": fmt.Sprintf("%s s%02d", cleanTitle, s),
 			}))
 		}
+	}
+
+	// Secondary query: Title + Year keyword (Movies only) — narrows matches on indexers
+	// that do free-text search, and gives indexers without IMDb-ID search (1337x, etc.)
+	// a chance to return anything at all.
+	if contentType == "movie" && year > 0 {
+		cleanTitle := strings.ReplaceAll(title, ":", "")
+		queries = append(queries, mergeParams(baseParams, map[string]string{
+			"query": fmt.Sprintf("%s %d", cleanTitle, year),
+		}))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
@@ -150,7 +166,8 @@ func (c *Client) queryCtx(ctx context.Context, params map[string]string) []Prowl
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	// catalog.Do adds retry (network errors/5xx) with exponential backoff, bounded by ctx's deadline.
+	resp, err := catalog.Do(ctx, c.httpClient, req)
 	if err != nil {
 		log.Printf("[Prowlarr] Error fetching from API: %v", err)
 		return nil
@@ -269,7 +286,11 @@ func (c *Client) resolveHashFromDownloadURL(downloadURL string) string {
 		},
 	}
 
-	resp, err := noRedirectClient.Do(req)
+	// catalog.Do adds retry here too (deliberate - consistency across both Prowlarr call sites
+	// was chosen over fail-fast, even though this runs on the concurrent search hot path and a
+	// flaky Prowlarr under load can now add up to ~3s backoff per item before this 8s-deadline
+	// function gives up, versus the previous single-shot behavior).
+	resp, err := catalog.Do(ctx, noRedirectClient, req)
 	if err != nil {
 		return ""
 	}

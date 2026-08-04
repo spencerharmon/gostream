@@ -17,11 +17,13 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"gostream/internal/catalog"
-	"gostream/internal/catalog/tmdb"
-	"gostream/internal/catalog/torrentio"
-	"gostream/internal/library"
-	"gostream/internal/prowlarr"
+	"tiramisu/internal/catalog"
+	"tiramisu/internal/catalog/rottentomatoes"
+	"tiramisu/internal/catalog/tmdb"
+	"tiramisu/internal/catalog/torrentio"
+	"tiramisu/internal/config"
+	"tiramisu/internal/library"
+	"tiramisu/internal/prowlarr"
 )
 
 // MovieGoEngine is the pure Go implementation of movie sync.
@@ -30,6 +32,7 @@ type MovieGoEngine struct {
 	tmdb      *tmdb.Client
 	torrentio *torrentio.Client
 	prowlarr  *prowlarr.Client
+	rt        *rottentomatoes.Client
 	plexURL   string
 	plexToken string
 	plexLib   int
@@ -52,6 +55,12 @@ type MovieGoEngine struct {
 
 	blacklist     BlacklistData
 	blacklistFile string
+
+	invalidatePath func(string)
+
+	reITA         *regexp.Regexp
+	reExclLang    *regexp.Regexp
+	exclLanguages map[string]bool
 }
 
 // CacheEntry is a generic cache entry with timestamp.
@@ -86,6 +95,10 @@ type MovieEngineConfig struct {
 	StateDir     string
 	LogsDir      string
 	ProwlarrCfg  prowlarr.ConfigProwlarr
+	Language     config.LanguageConfig
+	// InvalidatePath, when set, is called after removing a stub file so the FUSE
+	// layer drops its cached state for it (see main.invalidateSyncRemovedPath).
+	InvalidatePath func(string)
 }
 
 // Movie thresholds
@@ -102,7 +115,7 @@ const (
 	mMovieUnknownPenalty = -5
 	mMovieMinSeeders     = 15
 	mMovie4KMinGB        = 10
-	mMovie4KMaxGB        = 60
+	mMovie4KMaxGB        = 40
 	mMovie1080PMinGB     = 4
 	mMovie1080PMaxGB     = 20
 	mMovieUpgradePct     = 1.1
@@ -118,17 +131,16 @@ const (
 )
 
 var (
-	reM4K        = regexp.MustCompile(`(?i)2160p|4[kK]|uhd`)
-	reM1080p     = regexp.MustCompile(`(?i)1080p|1080i|fhd`)
-	reM720p      = regexp.MustCompile(`(?i)720p|720i`)
-	reMHDR       = regexp.MustCompile(`(?i)\bhdr\b|hdr10\+?`)
-	reMDV        = regexp.MustCompile(`(?i)\bdv\b|dovi|dolby.?vision`)
+	reM4K    = regexp.MustCompile(`(?i)2160p|4[kK]|uhd`)
+	reM1080p = regexp.MustCompile(`(?i)1080p|1080i|fhd`)
+	reM720p  = regexp.MustCompile(`(?i)720p|720i`)
+	// \b treats "_" as a word char, so "\bhdr\b" misses "_HDR_" - use a custom boundary.
+	reMHDR       = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])hdr(?:$|[^A-Za-z0-9])|hdr10\+?`)
+	reMDV        = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])dv(?:$|[^A-Za-z0-9])|dovi|dolby.?vision`)
 	reMAtmos     = regexp.MustCompile(`(?i)atmos`)
 	reM51        = regexp.MustCompile(`(?i)5\.1|dts|ddp5|ddp|dd\+|eac3|ac3`)
 	reMStereo    = regexp.MustCompile(`(?i)stereo|aac|mp3|2\.0`)
-	reMRemux     = regexp.MustCompile(`(?i)\bremux\b`)
-	reMITA       = regexp.MustCompile(`(?i)\bita\b|🇮🇹`)
-	reMExclLang  = regexp.MustCompile(`🇪🇸|🇫🇷|🇩🇪|🇷🇺|🇨🇳|🇯🇵|🇰🇷|🇹🇭|🇵🇹|🇧🇷`)
+	reMRemux     = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])remux(?:$|[^A-Za-z0-9])`)
 	reMGarbage   = regexp.MustCompile(`(?i)camrip|hdcam|hdts|telesync|\bts\b|telecine|\btc\b|\bscr\b|screener|webscreener`)
 	reMSeeders   = regexp.MustCompile(`👤\s*(\d+)`)
 	reMHashURL   = regexp.MustCompile(`link=([a-f0-9]{40})`)
@@ -155,6 +167,7 @@ func NewMovieGoEngine(cfg MovieEngineConfig) *MovieGoEngine {
 		tmdb:      tmdb.NewClient(cfg.TMDBAPIKey),
 		torrentio: torrentio.NewClient(cfg.TorrentioURL, "sort=qualitysize|qualityfilter=480p,720p,scr,cam"),
 		prowlarr:  prowlarrClient,
+		rt:        rottentomatoes.NewClient(),
 		plexURL:   cfg.PlexURL,
 		plexToken: cfg.PlexToken,
 		plexLib:   cfg.PlexLib,
@@ -169,6 +182,11 @@ func NewMovieGoEngine(cfg MovieEngineConfig) *MovieGoEngine {
 		addFailCFile:   filepath.Join(cfg.StateDir, "movie_add_fail_cache.json"),
 		imdbCFile:      filepath.Join(cfg.StateDir, "movie_imdb_cache.json"),
 		blacklistFile:  filepath.Join(cfg.StateDir, "blacklist.json"),
+		invalidatePath: cfg.InvalidatePath,
+
+		reITA:         CompileLanguageRegex(cfg.Language.PreferredTerms, cfg.Language.PreferredFlags),
+		reExclLang:    CompileLanguageRegex(ExcludedTitleTerms(cfg.Language.ExcludedFlags), cfg.Language.ExcludedFlags),
+		exclLanguages: ExcludedLanguageSet(cfg.Language.ExcludedFlags),
 	}
 
 	e.noMKVCache = e.loadCache(e.noMKVCFile)
@@ -181,6 +199,21 @@ func NewMovieGoEngine(cfg MovieEngineConfig) *MovieGoEngine {
 	e.pruneExpiredCaches()
 
 	return e
+}
+
+// removeStub deletes a stub file, invalidates its FUSE cache state, and removes the
+// underlying torrent from GoStorm. hash may be empty; a RemoveTorrent error doesn't
+// block the stub deletion.
+func (e *MovieGoEngine) removeStub(ctx context.Context, path, hash string) {
+	if hash != "" {
+		if err := e.gostorm.RemoveTorrent(ctx, hash); err != nil {
+			e.logger.Printf("[MovieSync] WARNING: failed to remove torrent %s for %s: %v", hash, filepath.Base(path), err)
+		}
+	}
+	os.Remove(path)
+	if e.invalidatePath != nil {
+		e.invalidatePath(path)
+	}
 }
 
 func (e *MovieGoEngine) Name() string { return "movies" }
@@ -221,7 +254,9 @@ func (e *MovieGoEngine) Run(ctx context.Context) error {
 		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 		client := catalog.NewClient(10 * time.Second)
 		resp, err := catalog.Do(context.Background(), client, req)
-		if err == nil {
+		if err != nil {
+			e.logger.Printf("[MovieSync] Warning: Plex library refresh failed: %v", err)
+		} else {
 			resp.Body.Close()
 		}
 	}
@@ -264,9 +299,27 @@ func (e *MovieGoEngine) discoverMovies(ctx context.Context) ([]tmdb.Movie, error
 			continue
 		}
 		for _, m := range movies {
-			if !seen[m.ID] {
+			if !seen[m.ID] && !e.exclLanguages[m.Language] {
 				seen[m.ID] = true
 				all = append(all, m)
+			}
+		}
+	}
+
+	// Rotten Tomatoes "Movies at Home": recent digital/streaming releases. Titles overlap only
+	// ~20% with the TMDB endpoints above (checked 2026-07-13), so each one is resolved against
+	// TMDB by title+year to fold into the same dedup/filter path as everything else.
+	if e.rt != nil {
+		if rtMovies, err := e.rt.FetchMoviesAtHome(ctx); err == nil {
+			for _, rm := range rtMovies {
+				m, err := e.tmdb.SearchMovieBest(ctx, rm.Title, rm.Year)
+				if err != nil {
+					continue
+				}
+				if !seen[m.ID] && !e.exclLanguages[m.Language] {
+					seen[m.ID] = true
+					all = append(all, m)
+				}
 			}
 		}
 	}
@@ -277,6 +330,7 @@ func (e *MovieGoEngine) discoverMovies(ctx context.Context) ([]tmdb.Movie, error
 type movieFile struct {
 	path  string
 	imdb  string
+	hash  string
 	score int
 }
 
@@ -303,15 +357,20 @@ func (e *MovieGoEngine) buildExistingMovieIndex() (map[string]movieFile, map[str
 		var imdb string
 		content := strings.TrimSpace(string(data))
 
+		var url string
 		// Try JSON format first (new Go format)
 		if strings.HasPrefix(content, "{") {
 			var obj map[string]interface{}
 			if err := json.Unmarshal([]byte(content), &obj); err == nil {
 				imdb, _ = obj["imdb"].(string)
+				url, _ = obj["url"].(string)
 			}
 		} else {
-			// Text format (old Python format): line 4 = IMDB ID
+			// Text format (old Python format): line 1 = URL, line 4 = IMDB ID
 			lines := strings.SplitN(content, "\n", 4)
+			if len(lines) >= 1 {
+				url = strings.TrimSpace(lines[0])
+			}
 			if len(lines) >= 4 {
 				imdb = strings.TrimSpace(lines[3])
 			}
@@ -320,9 +379,13 @@ func (e *MovieGoEngine) buildExistingMovieIndex() (map[string]movieFile, map[str
 		if imdb == "" {
 			return nil
 		}
+		var hash string
+		if m := reMHashURL.FindStringSubmatch(url); len(m) >= 2 {
+			hash = m[1]
+		}
 		score := e.calculateMovieScore(info.Name(), 0, 0, reM4K.MatchString(info.Name()))
 		if existing, ok := index[imdb]; !ok || score > existing.score {
-			index[imdb] = movieFile{path: path, imdb: imdb, score: score}
+			index[imdb] = movieFile{path: path, imdb: imdb, hash: hash, score: score}
 		}
 		return nil
 	})
@@ -375,7 +438,11 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 
 	// Get streams
 	e.logger.Printf("[MovieSync] Processing: %s (%s)", title, imdbID)
-	candidates, hadRaw, err := e.getMovieStreams(ctx, imdbID, title)
+	year := 0
+	if len(movie.ReleaseDate) >= 4 {
+		year, _ = strconv.Atoi(movie.ReleaseDate[:4])
+	}
+	candidates, hadRaw, err := e.getMovieStreams(ctx, imdbID, title, year)
 	if err != nil || len(candidates) == 0 {
 		if hadRaw {
 			e.setCache(e.recheckCache, imdbID, CacheEntry{Title: title, Reason: "no_valid_stream", TS: time.Now().Unix()})
@@ -441,7 +508,7 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 		// Remove existing if upgrading
 		if existingPath != "" {
 			e.logger.Printf("[MovieSync] Upgrade: removing %s", filepath.Base(existingPath))
-			os.Remove(existingPath)
+			e.removeStub(ctx, existingPath, existing.hash)
 		}
 
 		filename := library.BuildMovieFilename(title, movie.ReleaseDate, library.MovieStreamMeta{Title: c.Title, Hash: c.Hash, Is4K: c.Is4K})
@@ -474,12 +541,12 @@ type MovieStream struct {
 	SizeGB       float64
 }
 
-func (e *MovieGoEngine) getMovieStreams(ctx context.Context, imdbID, title string) ([]MovieStream, bool, error) {
+func (e *MovieGoEngine) getMovieStreams(ctx context.Context, imdbID, title string, year int) ([]MovieStream, bool, error) {
 	hadRaw := false
 
 	// Prowlarr first
 	if e.prowlarr != nil {
-		streams := e.prowlarr.FetchTorrents(imdbID, "movie", title)
+		streams := e.prowlarr.FetchTorrents(imdbID, "movie", title, year)
 		if len(streams) > 0 {
 			hadRaw = true
 			if candidates := e.filterMovieStreams(streams); len(candidates) > 0 {
@@ -550,7 +617,7 @@ func (e *MovieGoEngine) classifyMovieStream(s prowlarr.Stream) (*MovieStream, st
 	if reMGarbage.MatchString(fullText) {
 		return nil, "garbage"
 	}
-	if reMExclLang.MatchString(title) {
+	if e.reExclLang.MatchString(title) {
 		return nil, "excl_lang"
 	}
 	if e.isBlacklisted(title) {
@@ -629,7 +696,7 @@ func (e *MovieGoEngine) calculateMovieScore(text string, seeders int, sizeGB flo
 		score += mMovieRemuxBonus
 	}
 
-	if reMITA.MatchString(text) {
+	if e.reITA.MatchString(text) {
 		score += mMovieITABonus
 	}
 
@@ -711,7 +778,7 @@ func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 			return nil
 		}
 
-		var url, magnet string
+		var url, magnet, imdbID string
 		var size float64
 		content := strings.TrimSpace(string(data))
 
@@ -723,6 +790,7 @@ func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 			url, _ = obj["url"].(string)
 			magnet, _ = obj["magnet"].(string)
 			size, _ = obj["size"].(float64)
+			imdbID, _ = obj["imdb"].(string)
 		} else {
 			lines := strings.SplitN(content, "\n", 4)
 			if len(lines) < 3 {
@@ -732,6 +800,9 @@ func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 			magnet = strings.TrimSpace(lines[2])
 			if len(lines) > 1 {
 				size, _ = strconv.ParseFloat(strings.TrimSpace(lines[1]), 64)
+			}
+			if len(lines) >= 4 {
+				imdbID = strings.TrimSpace(lines[3])
 			}
 		}
 
@@ -749,7 +820,11 @@ func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 			displayTitle := TitleFromFilename(info.Name())
 			freshMagnet := BuildMagnet(hash, displayTitle, DefaultTrackers())
 			if _, err := e.gostorm.AddTorrent(ctx, freshMagnet, displayTitle); err == nil {
-				_ = library.WriteStub(path, url, int64(size), freshMagnet, "")
+				// Preserve the original imdb field — previously hardcoded to "", which silently
+				// wiped dedup metadata on every rehydration and let buildExistingMovieIndex's
+				// imdb=="" skip make the file invisible to future dedup checks (root cause of
+				// duplicate movie files after a torrent expired and got rehydrated).
+				e.createMKV(path, url, int64(size), freshMagnet, imdbID)
 			}
 		}
 
@@ -797,7 +872,7 @@ func (e *MovieGoEngine) cleanupOrphanedFiles(ctx context.Context) {
 			return nil
 		}
 		if !activeHashes[m[1]] {
-			os.Remove(path)
+			e.removeStub(ctx, path, m[1])
 		}
 		return nil
 	})
@@ -915,4 +990,26 @@ func (e *MovieGoEngine) saveIMDBCache(file string, data map[string]IMDBCacheEntr
 	tmp := file + ".tmp"
 	os.WriteFile(tmp, jsonData, 0644)
 	os.Rename(tmp, file)
+}
+
+// createMKV writes the JSON stub used to rehydrate a torrent-backed movie
+// file (mirrors library.WriteStub's schema — url/size/magnet/imdb — so it
+// stays byte-for-byte compatible with the existing gostream.db-adjacent stub
+// format; callers here need the imdb field preserved on rehydration, unlike
+// library.WriteStub's fixed-arity signature).
+func (e *MovieGoEngine) createMKV(path, streamURL string, fileSize int64, magnet, imdbID string) bool {
+	data := map[string]interface{}{
+		"url":    streamURL,
+		"size":   fileSize,
+		"magnet": magnet,
+		"imdb":   imdbID,
+	}
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return false
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return false
+	}
+	return os.WriteFile(path, jsonData, 0644) == nil
 }

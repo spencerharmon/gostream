@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/netip"
 	"net/url"
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"text/tabwriter"
 	"time"
 	"unsafe"
@@ -62,10 +64,82 @@ type Torrent struct {
 	dataUploadDisallowed   bool
 	userOnWriteChunkErr    func(error)
 
-	closed   chansync.SetOnce
-	onClose  []func()
-	infoHash metainfo.Hash
-	pieces   []Piece
+	closed chansync.SetOnce
+	// A background Context cancelled when the Torrent is closed. Shared by tracker scrapers to
+	// avoid spawning an extra per-tracker goroutine just to bridge me.t.Closed() into a local
+	// context (backported from anacrolix/torrent upstream, commit 6e3fd9a9e5).
+	closedCtx       context.Context
+	closedCtxCancel func()
+	onClose         []func()
+	infoHash        metainfo.Hash
+	pieces          []Piece
+
+	// warmupActive is set externally by the GoStorm layer (which owns DiskWarmup state) to
+	// signal whether this torrent currently has an in-flight warmup fetch, gating aggressive
+	// PEX churn (see AggressivePeerManagement in ClientConfig).
+	warmupActive atomic.Bool
+	// warmupFileID identifies which file (GoStorm's per-torrent file index) is being warmed, so
+	// churnIfUselessForWarmup/checkAndFireHedges can scope themselves to that file's real piece
+	// range (via File.BeginPieceIndex/EndPieceIndex) instead of assuming the warmed file is
+	// always file index 0 starting at piece 0 - wrong for multi-file torrents (season packs,
+	// releases with nfo/sample files before the main video).
+	warmupFileID atomic.Int64
+
+	// playbackPressureActive is set externally by the GoStream/Tiramisu pump loop when its lead
+	// over the player's read offset has worn thin (see nativePumpChunk's diff/budget check) -
+	// the same "buffer running low" signal already used to throttle the pump, reused here to
+	// extend tail-hedging beyond the initial warmup window into steady-state playback.
+	// playbackPressureOffset is the pump's current byte offset at the moment pressure was
+	// signaled, used to anchor the hedge piece window at the position actually being fetched
+	// right now instead of the file start. -1 means "no offset set" (pressure not active).
+	playbackPressureActive atomic.Bool
+	playbackPressureOffset atomic.Int64
+
+	// churnCooldown tracks IPs recently dropped by churnIfUselessForWarmup (lacked warmup-region
+	// pieces), keyed by IP (not IP:port - the same peer often reconnects from a new port), so a
+	// peer that just proved useless isn't immediately re-probed on reconnect. Not a ban (unlike
+	// AdaptiveShield's corruption-based bans) - lacking a piece is normal, legitimate behavior,
+	// just wasteful to re-probe every few seconds during an active warmup. Guarded by t.cl's lock
+	// (already held by every caller that touches this), not a separate mutex.
+	// churnCooldownEntry.probed distinguishes a fresh cooldown (peer gets one more full probe on
+	// its next reconnect, in case the first drop was just a slow bitfield) from one that has
+	// already used that second chance and failed again (further reconnects during the same
+	// window drop immediately, preserving the original point of the cooldown).
+	churnCooldown map[string]churnCooldownEntry
+
+	// warmupLatencySamples tracks rolling response-time samples per chunk size, used to compute
+	// a p95 threshold for tail-hedging warmup pieces (see warmupP95/recordWarmupLatency). Simple
+	// fixed-size ring buffer per size, not a full histogram library - only the small, bounded set
+	// of chunk sizes seen during warmup needs tracking.
+	warmupLatencyMu      sync.Mutex
+	warmupLatencySamples map[int64][]time.Duration
+
+	// hedgedRequests tracks which in-flight RequestIndexes have already been hedged once, so the
+	// watchdog (which ticks every 250ms) doesn't keep re-hedging the same still-pending request
+	// on every tick - "fire a duplicate, first response wins" means one hedge per request, not a
+	// repeated one. Entries are removed when the original request completes/cancels (see
+	// Peer.deleteRequest) so a request can be hedged again on a future, unrelated cold start.
+	hedgedRequests map[RequestIndex]struct{}
+
+	// hedgeTriggerCount is the total number of tail-hedge duplicate requests fired, for /metrics.
+	hedgeTriggerCount atomic.Int64
+	// hedgeCircuitOpen is true when hedging is auto-disabled because the trigger rate spiked -
+	// signals the shared VPN tunnel itself is the bottleneck, not peer variance, so hedging would
+	// only waste the pipe further. Auto-resets after a cooldown.
+	hedgeCircuitOpen atomic.Bool
+	// hedgeWindowStart/hedgeWindowCount track a rolling 60s hedge-rate window for the circuit
+	// breaker. hedgeWindowStart is a Unix nano timestamp.
+	hedgeWindowStart atomic.Int64
+	hedgeWindowCount atomic.Int64
+	// hedgeWatchdogRunning guards against spawning more than one hedgeWatchdog goroutine per
+	// warmup-active cycle - SetWarmupActive(true) is called repeatedly (once per WriteChunk).
+	hedgeWatchdogRunning atomic.Bool
+
+	// Outlier peer ejection pacing (see samplePeerEwma/maybeEjectOutlierPeer). Timestamps guarded
+	// by t.cl's lock; peerEjectCount is atomic for lock-free /metrics reads.
+	lastPeerEwmaSampleAt time.Time
+	lastPeerEjectCheckAt time.Time
+	peerEjectCount       atomic.Int64
 
 	// The order pieces are requested if there's no stronger reason like availability or priority.
 	pieceRequestOrder []int
@@ -283,20 +357,6 @@ func (t *Torrent) pieceCompleteUncached(piece pieceIndex) storage.Completion {
 		return storage.Completion{Complete: false, Ok: true}
 	}
 	return t.pieces[piece].Storage().Completion()
-}
-
-// There's a connection to that address already.
-func (t *Torrent) addrActive(addr string) bool {
-	if _, ok := t.halfOpen[addr]; ok {
-		return true
-	}
-	for c := range t.conns {
-		ra := c.RemoteAddr
-		if ra.String() == addr {
-			return true
-		}
-	}
-	return false
 }
 
 func (t *Torrent) appendUnclosedConns(ret []*PeerConn) []*PeerConn {
@@ -893,11 +953,483 @@ func (t *Torrent) numPiecesCompleted() (num pieceIndex) {
 	return pieceIndex(t._completedPieces.GetCardinality())
 }
 
+// SetWarmupActive is called by the GoStorm layer (which owns DiskWarmup state) to signal
+// whether this torrent currently has an in-flight warmup fetch, gating aggressive PEX churn.
+func (t *Torrent) SetWarmupActive(active bool, fileID int) {
+	t.warmupFileID.Store(int64(fileID))
+	t.warmupActive.Store(active)
+	// SetWarmupActive(true) is called repeatedly (once per WriteChunk) while warmup is in
+	// flight - only spawn one watchdog per cycle. CompareAndSwap ensures a second call while one
+	// is already running is a no-op; the running watchdog resets this to false itself on exit.
+	if active && t.hedgeWatchdogRunning.CompareAndSwap(false, true) {
+		go t.hedgeWatchdog()
+	}
+}
+
+// churnCooldownEntry is the value type of Torrent.churnCooldown - see that field's doc comment.
+type churnCooldownEntry struct {
+	until  time.Time
+	probed bool
+}
+
+// churnCooldownKey returns the key used to index Torrent.churnCooldown for a peer address:
+// the host part when addr splits cleanly (so a peer reconnecting from a new port still hits
+// its own cooldown entry), or the address's full string otherwise - hosts that don't split
+// (malformed/atypical RemoteAddr) would otherwise never land in churnCooldown at all, letting
+// them dodge the cooldown and get re-probed every time (see churnIfUselessForWarmup).
+func churnCooldownKey(addr PeerRemoteAddr) string {
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil && host != "" {
+		return host
+	}
+	return addr.String()
+}
+
+// warmupPieceRange returns the [begin, end) piece index range for the file currently being
+// warmed (per warmupFileID), scoped to at most maxPieces from the start of that file - not the
+// whole torrent. Returns ok=false if the file index is out of range or metadata isn't resolved
+// yet (caller should treat that as "don't restrict, or skip" as appropriate).
+func (t *Torrent) warmupPieceRange(maxPieces int) (begin, end pieceIndex, ok bool) {
+	if !t.haveInfo() {
+		return 0, 0, false
+	}
+	files := t.Files()
+	fileID := int(t.warmupFileID.Load())
+	if fileID < 0 || fileID >= len(files) {
+		return 0, 0, false
+	}
+	f := files[fileID]
+	begin = pieceIndex(f.BeginPieceIndex())
+	end = pieceIndex(f.EndPieceIndex())
+	if cap := begin + pieceIndex(maxPieces); cap < end {
+		end = cap
+	}
+	return begin, end, true
+}
+
+// SetPlaybackPressure is called by the GoStream/Tiramisu pump loop when its lead over the
+// player's read offset has worn thin (see nativePumpChunk), to extend tail-hedging into
+// steady-state playback instead of only the initial warmup window. offset is the pump's current
+// byte position when active is true; ignored when active is false.
+func (t *Torrent) SetPlaybackPressure(active bool, offset int64) {
+	if active {
+		t.playbackPressureOffset.Store(offset)
+	} else {
+		t.playbackPressureOffset.Store(-1)
+	}
+	t.playbackPressureActive.Store(active)
+	// Shares hedgeWatchdogRunning with SetWarmupActive: whichever of the two signals first, only
+	// one watchdog goroutine runs at a time, and it keeps going as long as either is active (see
+	// hedgeWatchdog's exit condition).
+	if active && t.hedgeWatchdogRunning.CompareAndSwap(false, true) {
+		go t.hedgeWatchdog()
+	}
+}
+
+// playbackPressureRange returns the [begin, end) piece range anchored at the pump's current
+// offset (set via SetPlaybackPressure), bounded to hedgeWarmupPieceWindow pieces - the same
+// window size used for warmup, since both cover "the next chunk of data the player needs soon".
+// Unlike warmupPieceRange, which is anchored at the start of the warmed file, this follows the
+// pump as it advances through the file during normal playback.
+func (t *Torrent) playbackPressureRange() (begin, end pieceIndex, ok bool) {
+	if !t.haveInfo() {
+		return 0, 0, false
+	}
+	offset := t.playbackPressureOffset.Load()
+	if offset < 0 || t.info.PieceLength <= 0 {
+		return 0, 0, false
+	}
+	numPieces := t.numPieces()
+	begin = pieceIndex(offset / t.info.PieceLength)
+	if begin >= numPieces {
+		return 0, 0, false
+	}
+	end = begin + hedgeWarmupPieceWindow
+	if end > numPieces {
+		end = numPieces
+	}
+	return begin, end, true
+}
+
+// HedgeTriggerCount returns the total number of tail-hedge duplicate requests fired for this
+// torrent, for /metrics.
+func (t *Torrent) HedgeTriggerCount() int64 {
+	return t.hedgeTriggerCount.Load()
+}
+
+// HedgeCircuitOpen reports whether this torrent's hedge circuit breaker is currently tripped
+// (auto-disabled due to an excessive hedge rate), for /metrics.
+func (t *Torrent) HedgeCircuitOpen() bool {
+	return t.hedgeCircuitOpen.Load()
+}
+
+// PeerEjectCount returns the total number of outlier peers proactively ejected from this
+// torrent (see maybeEjectOutlierPeer), for /metrics.
+func (t *Torrent) PeerEjectCount() int64 {
+	return t.peerEjectCount.Load()
+}
+
+const (
+	hedgeWatchdogInterval = 250 * time.Millisecond
+	// hedgeCircuitBreakerThreshold: reviewed 2026-07-03 against real production data (a Plex
+	// movie scan generating warmup traffic across 12 distinct torrents) - 4 trips, on 4 different
+	// torrents, each independently reaching ~31 hedges/60s during its own warmup burst. Confirmed
+	// reasonable as-is.
+	hedgeCircuitBreakerThreshold = 30
+	hedgeCircuitBreakerWindow    = 60 * time.Second
+	hedgeCircuitBreakerCooldown  = 5 * time.Minute
+	// hedgeNoBaselineCeiling: stateless fallback threshold used when warmupP95 has too few
+	// samples to be trusted (ok=false) - covers cold starts on dead swarms (zero responses
+	// ever) AND playback-pressure on resumed torrents, where warmupActive is never set and
+	// no latency samples are ever recorded. Anchored at 2x the fork's own streaming
+	// targetLatency (2.0s, peer.go nominalMaxRequests): a chunk pending >4s while warmup or
+	// playback-pressure is active is unambiguously on the freeze critical path (TTFF target
+	// 2-4s cold start). First reasonable value derived theoretically, NOT production-
+	// validated - calibrate from /metrics + [TailHedge] 'exceeded ceiling' logs, same method
+	// used for hedgeCircuitBreakerThreshold (which was validated on real data 2026-07-03).
+	hedgeNoBaselineCeiling = 4 * time.Second
+)
+
+// hedgeWatchdog periodically scans in-flight requests within whichever region is currently
+// active (warmup, or playback pressure - see SetWarmupActive/SetPlaybackPressure) and fires a
+// duplicate request to a next-best peer for any exceeding the observed p95 for its size (or the
+// fixed hedgeNoBaselineCeiling when no baseline exists). Spawned
+// once from either signal; exits on its own once both end or the torrent closes, resetting
+// hedgeWatchdogRunning so a future cycle can spawn a fresh one.
+func (t *Torrent) hedgeWatchdog() {
+	defer t.hedgeWatchdogRunning.Store(false)
+	for {
+		time.Sleep(hedgeWatchdogInterval)
+		t.cl.lock()
+		if t.closed.IsSet() || (!t.warmupActive.Load() && !t.playbackPressureActive.Load()) {
+			t.cl.unlock()
+			return
+		}
+		if !t.cl.config.AggressivePeerManagement || t.hedgeCircuitOpen.Load() {
+			t.cl.unlock()
+			continue
+		}
+		t.checkAndFireHedges()
+		// Shares this tick's gates with hedging - same reasoning for skipping when saturated.
+		now := time.Now()
+		t.samplePeerEwma(now)
+		t.maybeEjectOutlierPeer(now)
+		t.cl.unlock()
+	}
+}
+
+// checkAndFireHedges scans currently in-flight requests and hedges any warmup-region request
+// that has exceeded the observed p95 latency for its size - or, when no trustworthy latency
+// baseline exists, the fixed hedgeNoBaselineCeiling. Client lock must be held.
+// hedgeWarmupPieceWindow bounds hedging to the first N pieces of the file being warmed - wider
+// than Task 3's 3-piece connection probe (which only needs a cheap "does this peer look useful"
+// signal), since hedging should cover the actual in-flight warmup fetch range. The fork doesn't
+// have direct access to warmup.FileSize (a Tiramisu-level constant, unreachable across the
+// module boundary), so this is a generous fixed approximation - 32 pieces safely covers a 64MB
+// warmup window for typical piece sizes (2-8MB) without requiring exact byte-range knowledge.
+const hedgeWarmupPieceWindow = 32
+
+func (t *Torrent) checkAndFireHedges() {
+	// Warmup takes priority when both are active (rare, only at the warmup/playback boundary):
+	// its range is already anchored where the initial fetch is actually happening, and the two
+	// regions usually overlap early in the file anyway.
+	var begin, end pieceIndex
+	var ok bool
+	if t.warmupActive.Load() {
+		begin, end, ok = t.warmupPieceRange(hedgeWarmupPieceWindow)
+	} else {
+		begin, end, ok = t.playbackPressureRange()
+	}
+	if !ok {
+		return // metadata not resolved yet, file index out of range, or no pressure offset set
+	}
+	now := time.Now()
+	for r, rs := range t.requestState {
+		if t.hedgeCircuitOpen.Load() {
+			// A single scan can find many simultaneously-stalled requests (e.g. a near-dead
+			// swarm) - stop as soon as the breaker trips mid-loop instead of calling fireHedge
+			// (and re-tripping/re-logging) once per remaining stalled request in this same scan.
+			return
+		}
+		if _, alreadyHedged := t.hedgedRequests[r]; alreadyHedged {
+			continue // one hedge per request - don't re-hedge an already-hedged still-pending request
+		}
+		req := t.requestIndexToRequest(r)
+		pieceIdx := pieceIndex(req.Index)
+		if pieceIdx < begin || pieceIdx >= end {
+			continue // outside the warmed file's piece range - not a warmup-region request
+		}
+		threshold, ok := t.warmupP95(int64(req.Length))
+		trigger := "p95"
+		if !ok {
+			// No trustworthy latency baseline (dead-swarm cold start, or resumed torrent
+			// whose warmup never ran): fall back to the stateless absolute ceiling.
+			// Deliberately NOT a clamp - when p95 exists it always wins, even above the
+			// ceiling (see spec §3 decision 1).
+			threshold = hedgeNoBaselineCeiling
+			trigger = "ceiling"
+		}
+		if now.Sub(rs.when) < threshold {
+			continue
+		}
+		t.fireHedge(r, req, rs.peer, trigger)
+	}
+}
+
+// fireHedge sends a duplicate request for req to a next-best available peer (one that isn't
+// already holding the request and reports having the piece, preferring the peer with the most
+// recent useful chunk received - the same recency signal already used for request-stealing in
+// applyRequestState, not a new ranking mechanism). The duplicate is sent as a raw wire request
+// via peerImpl._request, bypassing t.requestState bookkeeping entirely (which enforces one peer
+// per request index) - the existing "redundant chunk" handling in receiveChunk already discards
+// whichever response arrives second, so this needs no new reconciliation logic. Gated by a
+// rolling 60s hedge-rate circuit breaker: if hedges spike, that signals the shared VPN tunnel
+// itself is saturated (not peer variance), so hedging is auto-disabled for a cooldown period
+// rather than making tunnel contention worse. Client lock must be held.
+//
+// trigger labels which threshold fired ("p95" or "ceiling") and is used only in the log
+// line - it exists so production calibration can distinguish baseline-driven hedges from
+// no-baseline ceiling hedges (see hedgeNoBaselineCeiling).
+func (t *Torrent) fireHedge(r RequestIndex, req Request, currentPeer *Peer, trigger string) {
+	// Pick the candidate BEFORE touching the circuit breaker's rate counter - a stalled request
+	// with no alternative peer available (common in exactly the low-peer-count swarms this
+	// feature targets) must not count against the breaker, since zero duplicate bytes are ever
+	// sent. Counting failed attempts here would let a single chronically-stalled request in a
+	// 1-2-peer swarm trip the breaker in seconds on phantom "hedge" traffic that never happened.
+	pieceIdx := pieceIndex(req.Index)
+	var candidate *Peer
+	t.iterPeers(func(p *Peer) {
+		if p == currentPeer || !p.peerHasPiece(pieceIdx) {
+			return
+		}
+		if candidate == nil || p.lastUsefulChunkReceived.After(candidate.lastUsefulChunkReceived) {
+			candidate = p
+		}
+	})
+	if candidate == nil {
+		return // no alternative peer available right now - don't mark as hedged, retry next tick
+	}
+
+	nowNano := time.Now().UnixNano()
+	windowStart := t.hedgeWindowStart.Load()
+	if windowStart == 0 || time.Duration(nowNano-windowStart) > hedgeCircuitBreakerWindow {
+		t.hedgeWindowStart.Store(nowNano)
+		t.hedgeWindowCount.Store(0)
+	}
+	count := t.hedgeWindowCount.Add(1)
+	if count > hedgeCircuitBreakerThreshold {
+		// CompareAndSwap so the trip log/cooldown-scheduling only happens once, even though
+		// count keeps climbing past the threshold on every subsequent call within the same
+		// window (e.g. a single checkAndFireHedges scan finding many stalled requests at once).
+		if !t.hedgeCircuitOpen.CompareAndSwap(false, true) {
+			return
+		}
+		t.logger.WithDefaultLevel(log.Warning).Printf("[TailHedge] hash=%s Circuit breaker tripped: %d hedges/60s, disabling — VPN tunnel likely saturated, not peer variance", t.infoHash.HexString(), count)
+		time.AfterFunc(hedgeCircuitBreakerCooldown, func() {
+			t.hedgeCircuitOpen.Store(false)
+			t.hedgeWindowCount.Store(0)
+			t.logger.WithDefaultLevel(log.Warning).Printf("[TailHedge] hash=%s Circuit breaker cooldown elapsed, re-enabling hedging", t.infoHash.HexString())
+		})
+		return
+	}
+	if t.hedgedRequests == nil {
+		t.hedgedRequests = make(map[RequestIndex]struct{})
+	}
+	t.hedgedRequests[r] = struct{}{}
+	// Mark the request as expected on the candidate's own per-connection bookkeeping (mirrors
+	// what Peer.request does) WITHOUT touching t.requestState[r] or candidate.requestState.Requests
+	// - those still point at currentPeer, preserving the one-peer-per-request invariant elsewhere
+	// in this file. Without this, receiveChunk would reject the hedge response as "unexpected
+	// chunk" (an error) instead of gracefully treating it as redundant/discardable.
+	if candidate.validReceiveChunks == nil {
+		candidate.validReceiveChunks = make(map[RequestIndex]int)
+	}
+	candidate.validReceiveChunks[r]++
+	candidate.peerImpl._request(req)
+	t.hedgeTriggerCount.Add(1)
+	t.logger.WithDefaultLevel(log.Warning).Printf("[TailHedge] hash=%s Hedging piece=%d begin=%d to %v (original request exceeded %s)", t.infoHash.HexString(), req.Index, req.Begin, candidate.RemoteAddr, trigger)
+}
+
+// maxWarmupLatencySamples caps the ring buffer per chunk size - only enough recent samples to
+// compute a meaningful p95, not an unbounded history.
+const maxWarmupLatencySamples = 50
+
+// minWarmupLatencySamplesForP95 is the minimum sample count before warmupP95 trusts its result -
+// below this, there isn't enough data to hedge confidently yet.
+const minWarmupLatencySamplesForP95 = 10
+
+// recordWarmupLatency appends a response-time sample for a warmup-region chunk of the given size,
+// dropping the oldest sample once the ring buffer for that size is full.
+func (t *Torrent) recordWarmupLatency(size int64, d time.Duration) {
+	t.warmupLatencyMu.Lock()
+	defer t.warmupLatencyMu.Unlock()
+	if t.warmupLatencySamples == nil {
+		t.warmupLatencySamples = make(map[int64][]time.Duration)
+	}
+	samples := t.warmupLatencySamples[size]
+	if len(samples) >= maxWarmupLatencySamples {
+		samples = samples[1:]
+	}
+	t.warmupLatencySamples[size] = append(samples, d)
+}
+
+// warmupP95 returns the 95th percentile response time observed for warmup-region chunks of the
+// given size. ok is false if fewer than minWarmupLatencySamplesForP95 samples have been recorded
+// yet - not enough data to hedge against confidently.
+func (t *Torrent) warmupP95(size int64) (p95 time.Duration, ok bool) {
+	t.warmupLatencyMu.Lock()
+	samples := t.warmupLatencySamples[size]
+	if len(samples) < minWarmupLatencySamplesForP95 {
+		t.warmupLatencyMu.Unlock()
+		return 0, false
+	}
+	sorted := make([]time.Duration, len(samples))
+	copy(sorted, samples)
+	t.warmupLatencyMu.Unlock()
+
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	idx := int(float64(len(sorted)) * 0.95)
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx], true
+}
+
+const (
+	peerEwmaSampleInterval = 5 * time.Second
+	peerEwmaAlpha          = 0.3
+	peerEjectCheckInterval = 10 * time.Second
+	peerEjectMinConns      = 8   // never eject below this swarm size
+	peerEjectMedianRatio   = 0.2 // outlier threshold: EWMA below this fraction of swarm median
+	peerEjectUselessAfter  = 10 * time.Second
+	peerEjectGracePeriod   = 30 * time.Second // don't judge connections younger than this
+	peerEjectCooldown      = 60 * time.Second // keep ejected IP out of outgoing dials
+)
+
+// samplePeerEwma updates each connected peer's throughput EWMA. Called from the hedge watchdog
+// tick; self-paces to peerEwmaSampleInterval. Client lock must be held.
+func (t *Torrent) samplePeerEwma(now time.Time) {
+	if now.Sub(t.lastPeerEwmaSampleAt) < peerEwmaSampleInterval {
+		return
+	}
+	t.lastPeerEwmaSampleAt = now
+	for c := range t.conns {
+		useful := c._stats.BytesReadUsefulData.Int64()
+		if c.ewmaLastSampleAt.IsZero() {
+			c.ewmaLastBytes = useful
+			c.ewmaLastSampleAt = now
+			continue
+		}
+		dt := now.Sub(c.ewmaLastSampleAt).Seconds()
+		if dt <= 0 {
+			continue
+		}
+		inst := float64(useful-c.ewmaLastBytes) / dt
+		c.ewmaLastBytes = useful
+		c.ewmaLastSampleAt = now
+		if !c.ewmaSeeded {
+			c.ewmaRate = inst
+			c.ewmaSeeded = true
+		} else {
+			c.ewmaRate = peerEwmaAlpha*inst + (1-peerEwmaAlpha)*c.ewmaRate
+		}
+	}
+}
+
+// maybeEjectOutlierPeer drops at most one statistical outlier connection per check, when the
+// pool is full and a replacement is queued in t.peers. Never ejects the sole source of an
+// imminently-needed piece. Client lock must be held.
+func (t *Torrent) maybeEjectOutlierPeer(now time.Time) {
+	if now.Sub(t.lastPeerEjectCheckAt) < peerEjectCheckInterval {
+		return
+	}
+	t.lastPeerEjectCheckAt = now
+	if len(t.conns) < peerEjectMinConns || len(t.conns) < t.maxEstablishedConns-2 {
+		return
+	}
+	if t.peers.Len() == 0 {
+		return // no queued replacement - a slow slot beats an empty one
+	}
+	rates := make([]float64, 0, len(t.conns))
+	var worst *PeerConn
+	for c := range t.conns {
+		if !c.ewmaSeeded || now.Sub(c.completedHandshake) < peerEjectGracePeriod {
+			continue
+		}
+		rates = append(rates, c.ewmaRate)
+		if worst == nil || c.ewmaRate < worst.ewmaRate {
+			worst = c
+		}
+	}
+	if worst == nil || len(rates) < peerEjectMinConns {
+		return
+	}
+	sort.Float64s(rates)
+	median := rates[len(rates)/2]
+	if median <= 0 {
+		return // swarm-wide stall (pause, tunnel hiccup) - nothing to single out
+	}
+	if worst.ewmaRate >= median*peerEjectMedianRatio {
+		return
+	}
+	if now.Sub(worst.lastUsefulChunkReceived) < peerEjectUselessAfter {
+		return
+	}
+	if t.peerIsSolePieceSource(worst) {
+		return
+	}
+	if t.churnCooldown == nil {
+		t.churnCooldown = make(map[string]churnCooldownEntry)
+	}
+	t.churnCooldown[churnCooldownKey(worst.RemoteAddr)] = churnCooldownEntry{until: now.Add(peerEjectCooldown)}
+	t.peerEjectCount.Add(1)
+	uselessFor := "ever (no useful chunk received)"
+	if !worst.lastUsefulChunkReceived.IsZero() {
+		uselessFor = now.Sub(worst.lastUsefulChunkReceived).Round(time.Second).String()
+	}
+	t.logger.WithDefaultLevel(log.Warning).Printf(
+		"[PeerEject] hash=%s dropping outlier peer %v: ewma %.0f B/s vs swarm median %.0f B/s, no useful chunk for %s",
+		t.infoHash.HexString(), worst.RemoteAddr, worst.ewmaRate, median, uselessFor)
+	worst.drop()
+	t.openNewConns()
+}
+
+// peerIsSolePieceSource reports whether c is the only connected peer with an incomplete piece
+// in the active warmup/playback-pressure window.
+func (t *Torrent) peerIsSolePieceSource(c *PeerConn) bool {
+	var begin, end pieceIndex
+	var ok bool
+	if t.warmupActive.Load() {
+		begin, end, ok = t.warmupPieceRange(hedgeWarmupPieceWindow)
+	} else {
+		begin, end, ok = t.playbackPressureRange()
+	}
+	if !ok {
+		return false
+	}
+	for i := begin; i < end; i++ {
+		if t.pieceComplete(i) || !c.peerHasPiece(i) {
+			continue
+		}
+		held := false
+		for other := range t.conns {
+			if other != c && other.peerHasPiece(i) {
+				held = true
+				break
+			}
+		}
+		if !held {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *Torrent) close(wg *sync.WaitGroup) (err error) {
 	if !t.closed.Set() {
 		err = errors.New("already closed")
 		return
 	}
+	t.closedCtxCancel()
 	for _, f := range t.onClose {
 		f()
 	}
@@ -972,13 +1504,6 @@ func (t *Torrent) pieceNumChunks(piece pieceIndex) chunkIndexType {
 
 func (t *Torrent) chunksPerRegularPiece() chunkIndexType {
 	return t._chunksPerRegularPiece
-}
-
-func (t *Torrent) numChunks() RequestIndex {
-	if t.numPieces() == 0 {
-		return 0
-	}
-	return RequestIndex(t.numPieces()-1)*t.chunksPerRegularPiece() + t.pieceNumChunks(t.numPieces()-1)
 }
 
 func (t *Torrent) pendAllChunkSpecs(pieceIndex pieceIndex) {
@@ -1264,13 +1789,6 @@ func (t *Torrent) publishPieceStateChange(piece pieceIndex) {
 	})
 }
 
-func (t *Torrent) pieceNumPendingChunks(piece pieceIndex) pp.Integer {
-	if t.pieceComplete(piece) {
-		return 0
-	}
-	return pp.Integer(t.pieceNumChunks(piece) - t.pieces[piece].numDirtyChunks())
-}
-
 func (t *Torrent) pieceAllDirty(piece pieceIndex) bool {
 	return t.pieces[piece].allChunksDirty()
 }
@@ -1471,6 +1989,12 @@ func (t *Torrent) openNewConns() (initiated int) {
 			return
 		}
 		p := t.peers.PopMax()
+		// Skip IPs churned/ejected recently - avoid immediately re-filling a freed slot.
+		if t.cl.config.AggressivePeerManagement && len(t.churnCooldown) > 0 {
+			if entry, ok := t.churnCooldown[churnCooldownKey(p.Addr)]; ok && time.Now().Before(entry.until) {
+				continue
+			}
+		}
 		opts := outgoingConnOpts{
 			peerInfo:                 p,
 			t:                        t,
@@ -2293,21 +2817,46 @@ func (t *Torrent) pieceHashed(piece pieceIndex, passed bool, hashIoErr error) {
 					// https://github.com/anacrolix/torrent/issues/715.
 					t.logger.Levelf(log.Warning, "banning %v for being sole dirtier of piece %v after failed piece check", c, piece)
 					c.ban()
+					// V304: sole-dirtier attribution is certain (no other peer touched this piece),
+					// so persist immediately instead of waiting for badPeerThreshold like the
+					// multi-dirtier path below - there's no ambiguity here to average out. Without
+					// this, the highest-confidence corruption case had the weakest ban durability:
+					// c.ban() alone only writes to badPeerIPs (in-memory, process-lifetime), so a
+					// sole dirtier was fully rehabilitated on every restart while lower-confidence
+					// multi-dirtier bans persisted 30 days.
+					if ip := c.remoteIp(); ip != nil {
+						ipStr := ip.String()
+						if _, alreadyBanned := v304BannedIPs.LoadOrStore(ipStr, struct{}{}); !alreadyBanned {
+							t.logger.Levelf(log.Warning,
+								"[AdaptiveShield] evicting peer %v: sole dirtier of piece %v — ban applied",
+								ipStr, piece)
+							if v304OnBan != nil {
+								go v304OnBan(ipStr) // goroutine: no IO under cl lock
+							}
+						}
+					}
 				}
 			}
 
-			// V304: Threshold-based eviction — ban any peer with >= 3 bad pieces
-			// regardless of whether they are the sole dirtier.
-			// LoadOrStore ensures each IP is banned and logged only once per session.
+			// V304: Threshold-based eviction — ban any peer whose IP accumulates >= 3 bad
+			// pieces, counted per IP (not per connection) so reconnects don't reset the tally.
+			// LoadOrStore ensures each IP is banned and logged only once.
 			const badPeerThreshold int64 = 3
 			for _, c := range bannableTouchers {
-				if c.stats().PiecesDirtiedBad.Int64() >= badPeerThreshold {
-					ipStr := c.remoteIp().String()
+				ip := c.remoteIp()
+				if ip == nil {
+					continue
+				}
+				ipStr := ip.String()
+				if n := v304AddCorrupt(ipStr); n >= badPeerThreshold {
 					if _, alreadyBanned := v304BannedIPs.LoadOrStore(ipStr, struct{}{}); !alreadyBanned {
 						t.logger.Levelf(log.Warning,
-							"[AdaptiveShield] evicting peer %v: %d corrupt pieces (threshold %d) — session ban applied",
-							c.remoteIp(), c.stats().PiecesDirtiedBad.Int64(), badPeerThreshold)
+							"[AdaptiveShield] evicting peer %v: %d corrupt pieces (threshold %d) — ban applied",
+							ipStr, n, badPeerThreshold)
 						c.ban()
+						if v304OnBan != nil {
+							go v304OnBan(ipStr) // goroutine: no IO under cl lock
+						}
 					}
 				}
 			}
@@ -2379,16 +2928,22 @@ func (t *Torrent) tryCreatePieceHasher() bool {
 	if !ok {
 		return false
 	}
+	t.startHash(pi)
+	go t.pieceHasher(pi)
+	return true
+}
+
+// startHash marks a piece as actively hashing and reserves a hasher slot (storage RLock,
+// activePieceHashes/activePieceHashers counters). Caller must hold the client lock.
+func (t *Torrent) startHash(pi pieceIndex) {
 	p := t.piece(pi)
 	t.piecesQueuedForHash.Remove(bitmap.BitIndex(pi))
 	p.hashing = true
 	t.publishPieceStateChange(pi)
-	t.updatePiecePriority(pi, "Torrent.tryCreatePieceHasher")
+	t.updatePiecePriority(pi, "Torrent.startHash")
 	t.storageLock.RLock()
 	t.activePieceHashes++
 	t.cl.activePieceHashers++
-	go t.pieceHasher(pi)
-	return true
 }
 
 func (t *Torrent) getPieceToHash() (ret pieceIndex, ok bool) {
@@ -2427,7 +2982,35 @@ func (t *Torrent) dropBannedPeers() {
 	})
 }
 
-func (t *Torrent) pieceHasher(index pieceIndex) {
+// pieceHasher hashes the initial piece, then keeps consuming further queued pieces on the same
+// goroutine instead of spawning a new one per piece (backported from anacrolix/torrent upstream,
+// "Rearrange hashing so goroutines are reused" — avoids goroutine churn during large verify
+// bursts, e.g. right after adding a torrent or during a rehydration batch, and keeps the storage
+// backend "hot" between successive pieces of the same torrent). Respects the same per-torrent and
+// per-client concurrency caps as tryCreatePieceHasher. Deliberately keeps calling our own
+// getPieceToHash (with its p.marking check) rather than adopting upstream's rewritten version,
+// which dropped that check — see getPieceToHash for the race it guards against.
+func (t *Torrent) pieceHasher(initial pieceIndex) {
+	t.finishHash(initial)
+	for !t.closed.IsSet() &&
+		t.activePieceHashes < t.cl.config.PieceHashersPerTorrent &&
+		t.cl.activePieceHashers < runtime.NumCPU() {
+		pi, ok := t.getPieceToHash()
+		if !ok {
+			break
+		}
+		t.startHash(pi)
+		t.cl.unlock()
+		t.finishHash(pi)
+	}
+	t.tryCreateMorePieceHashers()
+	t.cl.unlock()
+}
+
+// finishHash hashes one piece's data and records the result. Called with the client lock
+// released (so the potentially slow hashPiece read doesn't block other torrent activity);
+// returns with the client lock held, mirroring the contract pieceHasher's loop depends on.
+func (t *Torrent) finishHash(index pieceIndex) {
 	p := t.piece(index)
 	sum, failedPeers, copyErr := t.hashPiece(index)
 	correct := sum == *p.hash
@@ -2438,7 +3021,6 @@ func (t *Torrent) pieceHasher(index pieceIndex) {
 	}
 	t.storageLock.RUnlock()
 	t.cl.lock()
-	defer t.cl.unlock()
 	if correct {
 		for peer := range failedPeers {
 			t.cl.banPeerIP(peer.AsSlice())
@@ -2451,13 +3033,12 @@ func (t *Torrent) pieceHasher(index pieceIndex) {
 	}
 	p.hashing = false
 	t.pieceHashed(index, correct, copyErr)
-	t.updatePiecePriority(index, "Torrent.pieceHasher")
+	t.updatePiecePriority(index, "Torrent.finishHash")
 	t.activePieceHashes--
 	if t.activePieceHashes == 0 {
 		t.updateComplete()
 	}
 	t.cl.activePieceHashers--
-	t.tryCreateMorePieceHashers()
 }
 
 // Return the connections that touched a piece, and clear the entries while doing it.
@@ -2467,13 +3048,6 @@ func (t *Torrent) clearPieceTouchers(pi pieceIndex) {
 		delete(c.peerTouchedPieces, pi)
 		delete(p.dirtiers, c)
 	}
-}
-
-func (t *Torrent) peersAsSlice() (ret []*Peer) {
-	t.iterPeers(func(p *Peer) {
-		ret = append(ret, p)
-	})
-	return
 }
 
 func (t *Torrent) queuePieceCheck(pieceIndex pieceIndex) {
@@ -2691,13 +3265,6 @@ func (t *Torrent) callbacks() *Callbacks {
 }
 
 type AddWebSeedsOpt func(*webseed.Client)
-
-// Sets the WebSeed trailing path escaper for a webseed.Client.
-func WebSeedPathEscaper(custom webseed.PathEscaper) AddWebSeedsOpt {
-	return func(c *webseed.Client) {
-		c.PathEscaper = custom
-	}
-}
 
 func (t *Torrent) AddWebSeeds(urls []string, opts ...AddWebSeedsOpt) {
 	t.cl.lock()
@@ -3056,13 +3623,6 @@ func (t *Torrent) trySendHolepunchRendezvous(addrPort netip.AddrPort) error {
 		return errors.New("no eligible relays")
 	}
 	return nil
-}
-
-func (t *Torrent) numHalfOpenAttempts() (num int) {
-	for _, attempts := range t.halfOpen {
-		num += len(attempts)
-	}
-	return
 }
 
 func (t *Torrent) getDialTimeoutUnlocked() time.Duration {

@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"gostream/internal/library"
+	"tiramisu/internal/library"
 )
 
 // GoStormClient is the subset of the engines.GoStormClient API that

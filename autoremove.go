@@ -11,8 +11,8 @@ import (
 	"regexp"
 	"strings"
 
-	"gostream/internal/gostorm/native"
-	"gostream/internal/vfs"
+	"tiramisu/internal/gostorm/native"
+	"tiramisu/internal/vfs"
 )
 
 // TorrentRemover handles automatic torrent removal from GoStorm
@@ -71,11 +71,6 @@ func (tr *TorrentRemover) RemoveTorrentFromFile(fullPath string) (bool, error) {
 	}
 
 	return true, nil
-}
-
-// RemoveTorrentByHash allows direct removal by hash (exposed for testing/manual use)
-func (tr *TorrentRemover) RemoveTorrentByHash(hash string) error {
-	return tr.removeTorrent(hash)
 }
 
 // extractHashFromFile reads the virtual mkv to get the hash.
