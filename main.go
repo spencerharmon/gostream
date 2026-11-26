@@ -938,6 +938,7 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		}
 	}
 
+	h.playerActivity.OpenedAt = now
 	activeHandles.Store(h, true)
 
 	return h, 0, 0
@@ -973,6 +974,7 @@ type MkvHandle struct {
 	lastActivityTime time.Time
 	monitorStarted   bool
 	lastGlobalUpdate time.Time
+	playerActivity   collector.StreamActivity // guarded by mu; FUSE demand, not pump reads
 
 	nativeReader    *native.NativeReader
 	hash            string
@@ -1639,7 +1641,7 @@ func safeGo(fn func()) {
 var _ fs.FileReader = (*MkvHandle)(nil)
 var _ fs.FileReleaser = (*MkvHandle)(nil)
 
-func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (result fuse.ReadResult, errno syscall.Errno) {
 	now := time.Now()
 	timing := &ReadTiming{StartTime: now}
 	defer func() {
@@ -1663,6 +1665,17 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 			})
 		}
 	}
+
+	readSequence := h.playerActivity.BeginRead(off, now)
+	defer func() {
+		n := 0
+		if errno == 0 && result != nil {
+			n = result.Size()
+		}
+		h.mu.Lock()
+		h.playerActivity.EndRead(readSequence, n, time.Now())
+		h.mu.Unlock()
+	}()
 
 	idleTime := now.Sub(h.lastActivityTime)
 	isFirstBlock := (off == 0) || (idleTime > time.Duration(gc().WarmStartIdleSeconds)*time.Second)
@@ -2278,6 +2291,8 @@ DATA_READY:
 }
 
 func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
+	// Also cover the early probe/no-slot return: released handles are not active streams.
+	defer activeHandles.Delete(h)
 	logger.Printf("=== RELEASE VIRTUAL === path=%s", h.path)
 
 	if val, ok := activePumps.Load(h.path); ok {
@@ -2352,8 +2367,6 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 
 	// Nil local reference only; pump goroutine owns the reader lifecycle via captured copy.
 	h.nativeReader = nil
-
-	activeHandles.Delete(h)
 
 	// Fast-drop (5s) for scanner probes never confirmed by webhook; 30s otherwise.
 	retentionDelay := 30 * time.Second
@@ -4008,6 +4021,7 @@ func main() {
 		gc().MetricsPort,
 		logsDir,
 	)
+	monCollector.SetStreamSampler(samplePlayerStreams)
 	dashHandler := dashboard.New(monCollector, logsDir)
 	http.HandleFunc("/dashboard", dashHandler.Dashboard)
 	http.HandleFunc("/api/health", dashHandler.Health)
@@ -4027,6 +4041,7 @@ func main() {
 		ValidationLeaseMin: gc().LibraryLeaseMinutes,
 	}
 	libHandler := dashboard.NewLibraryHandler(libCfg, engines.NewGoStormClient(gc().GoStormBaseURL))
+	registerPlayerStats(http.DefaultServeMux, libHandler, monCollector)
 	http.HandleFunc("/api/library/add", libHandler.Add)
 	http.HandleFunc("/api/library/remove", libHandler.Remove)
 	http.HandleFunc("/api/library/validate", libHandler.Validate)
