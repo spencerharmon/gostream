@@ -144,6 +144,9 @@ type Collector struct {
 
 	publicIP     string
 	publicIPTime time.Time
+
+	streamSampler func() map[string]StreamStats
+	streams       map[string]StreamStats
 }
 
 // New creates a Collector.
@@ -275,6 +278,7 @@ func (c *Collector) GostormURL() string { return c.gostormURL }
 // independent fetches concurrently - out of scope for now, revisit if staleness becomes a problem
 // in practice.
 func (c *Collector) collect() {
+	c.collectStreams()
 	s := HealthStatus{
 		Timestamp:  time.Now(),
 		Uptime:     time.Since(c.start).Round(time.Second).String(),

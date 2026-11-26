@@ -57,6 +57,7 @@ type Torrent struct {
 	closed <-chan struct{}
 
 	cachedFileStats []*state.TorrentFileStat
+	playerStats     atomic.Pointer[state.PlayerTorrentStats]
 }
 
 func NewTorrent(spec *torrent.TorrentSpec, bt *BTServer) (*Torrent, error) {
@@ -183,7 +184,7 @@ func (t *Torrent) UpdateStats() {
 		return
 	}
 
-	if t.Torrent != nil && t.Torrent.Info() != nil {
+	if t.Torrent != nil {
 		st := t.Torrent.Stats()
 		deltaDlBytes := st.BytesRead.Int64() - t.BytesReadUsefulData
 		deltaUpBytes := st.BytesWritten.Int64() - t.BytesWrittenData
@@ -194,6 +195,23 @@ func (t *Torrent) UpdateStats() {
 
 		t.BytesReadUsefulData = st.BytesRead.Int64()
 		t.BytesWrittenData = st.BytesWritten.Int64()
+
+		// Reuse this tick's expensive peer enumeration; player polls only load a
+		// fixed-size immutable sample, never Stats()/Status() or a piece scan.
+		now := time.Now()
+		rate := t.DownloadSpeed
+		sample := &state.PlayerTorrentStats{
+			Peers: &st.ActivePeers, Seeders: &st.ConnectedSeeders,
+			TorrentSampledAt: &now,
+		}
+		if deltaTime > 0 {
+			sample.DownloadRateBytesPerSec = &rate
+		}
+		if t.Torrent.Info() != nil {
+			size, completed := t.Torrent.Length(), t.Torrent.BytesCompleted()
+			sample.Size, sample.BytesCompleted = &size, &completed
+		}
+		t.playerStats.Store(sample)
 
 		if t.cache != nil {
 			t.PreloadedBytes = t.cache.GetState().Filled
