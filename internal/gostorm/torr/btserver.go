@@ -50,7 +50,6 @@ var dhtBootstrapHosts = []string{
 	"dht.aelitis.com:6881",
 
 	// Aggiunti per ridondanza
-	"router.bitcomet.com:6881",
 	"dht.vuze.com:6881",
 }
 
@@ -160,6 +159,8 @@ func (bt *BTServer) Connect() error {
 func (bt *BTServer) StartTicker() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	dhtSave := time.NewTicker(10 * time.Minute)
+	defer dhtSave.Stop()
 
 	bt.mu.Lock()
 	stop := bt.tickerStop
@@ -186,6 +187,8 @@ func (bt *BTServer) StartTicker() {
 			for _, t := range list {
 				t.UpdateStats()
 			}
+		case <-dhtSave.C:
+			bt.saveDhtNodes()
 		case <-stop:
 			return
 		}
@@ -196,6 +199,9 @@ func (bt *BTServer) Disconnect() {
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
 	if bt.client != nil {
+		if settings.BTsets != nil && !settings.BTsets.DisableDHT {
+			saveDhtNodesFrom(bt.client)
+		}
 		bt.client.Close()
 		bt.client = nil
 		close(bt.tickerStop)
@@ -230,7 +236,7 @@ func (bt *BTServer) configure(ctx context.Context) {
 	if !settings.BTsets.DisableDHT {
 		bt.config.DhtStartingNodes = func(network string) dht.StartingNodesGetter {
 			return func() ([]dht.Addr, error) {
-				addrs := resolveDhtBootstrapNodes()
+				addrs := append(loadPersistedDhtNodes(dhtNodesFile()), resolveDhtBootstrapNodes()...)
 				if len(addrs) == 0 {
 					// Fallback ai nodi default della libreria
 					log.Println("DHT Bootstrap: using library defaults (resolution failed)")
